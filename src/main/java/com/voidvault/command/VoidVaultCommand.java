@@ -101,7 +101,7 @@ public class VoidVaultCommand implements CommandExecutor {
         
         String targetName = args[1];
         int page = 1;
-        
+
         // Parse optional page argument
         if (args.length >= 3) {
             Integer parsedPage = ValidationUtil.parsePositiveInteger(args[2]);
@@ -112,14 +112,16 @@ public class VoidVaultCommand implements CommandExecutor {
                         .build());
                 return true;
             }
-            
+
+            int maxAllowedPages = configManager.getMaxPages();
             page = parsedPage;
-            if (page < 1 || page > 5) {
+            if (page < 1 || page > maxAllowedPages) {
                 messageManager.send(sender, "commands.invalid-page",
                     MessageManager.placeholders()
                         .add("page", page)
+                        .add("max", maxAllowedPages)
                         .build());
-                sender.sendMessage("§cPage must be between 1 and 5.");
+                sender.sendMessage("§cPage must be between 1 and " + maxAllowedPages + ".");
                 return true;
             }
         }
@@ -155,7 +157,7 @@ public class VoidVaultCommand implements CommandExecutor {
             }
         }).exceptionally(ex -> {
             logger.severe("Failed to open vault for admin: " + ex.getMessage());
-            ex.printStackTrace();
+            logger.log(java.util.logging.Level.SEVERE, "Exception details:", ex);
             messageManager.send(admin, "error.load-failed");
             return null;
         });
@@ -183,7 +185,7 @@ public class VoidVaultCommand implements CommandExecutor {
             logger.info("Configuration reloaded by " + sender.getName());
         } catch (Exception ex) {
             logger.severe("Failed to reload configuration: " + ex.getMessage());
-            ex.printStackTrace();
+            logger.log(java.util.logging.Level.SEVERE, "Exception details:", ex);
             messageManager.send(sender, "error.generic");
         }
         
@@ -375,13 +377,14 @@ public class VoidVaultCommand implements CommandExecutor {
             return true;
         }
         
-        // Validate page range (0 to reset, or 1-5)
-        if (amount != 0 && (amount < 1 || amount > 5)) {
+        // Validate page range (0 to reset, or 1..max-pages)
+        int maxAllowedPages = configManager.getMaxPages();
+        if (amount != 0 && (amount < 1 || amount > maxAllowedPages)) {
             messageManager.send(sender, "commands.invalid-number",
                 MessageManager.placeholders()
                     .add("input", amountStr)
                     .build());
-            sender.sendMessage("§cPages must be between 1 and 5, or 0 to reset.");
+            sender.sendMessage("§cPages must be between 1 and " + maxAllowedPages + ", or 0 to reset.");
             return true;
         }
         
@@ -602,7 +605,7 @@ public class VoidVaultCommand implements CommandExecutor {
             sendClickableCommand(sender,
                 "/voidvaults setpages <player> <amount>",
                 "Set custom page count",
-                "§7Override a player's page permissions\n§7Amount: 1-5 or 0 to reset\n§7Example: §e/voidvaults setpages Steve 5\n§a§lClick to suggest!",
+                "§7Override a player's page permissions\n§7Amount: 1-" + configManager.getMaxPages() + " or 0 to reset\n§7Example: §e/voidvaults setpages Steve " + configManager.getMaxPages() + "\n§a§lClick to suggest!",
                 "/voidvaults setpages ");
         }
         

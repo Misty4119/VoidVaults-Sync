@@ -4,17 +4,183 @@
 # PAGED: Feature-rich vault with multiple pages and utility functions
 plugin-mode: PAGED
 
-# Storage backend: YAML or MYSQL
-storage-type: YAML
+# -----------------------------------------------------------------------------
+# Storage backend. Supported values: YAML | MYSQL | REDIS | REDIS_PERSISTENT
+# -----------------------------------------------------------------------------
+# YAML             — File-based, single-server only
+# MYSQL            — Multi-server safe via shared database (HikariCP pooled)
+# REDIS            — Redis 8.0 primary, no persistent backup, cross-server sync via pub/sub
+# REDIS_PERSISTENT — Redis 8.0 primary + MySQL persistent backup (recommended for production)
+#                    Redis is the hot path, MySQL mirrors every write asynchronously
+#                    for crash-survival. On startup MySQL is queried for cache misses.
+#
+# Legacy aliases still work: storage-type: YAML  → treated as storage.type
+# -----------------------------------------------------------------------------
+storage:
+  type: REDIS_PERSISTENT
 
-# MySQL settings (only used if storage-type is MYSQL)
-mysql:
-  host: localhost
-  port: 3306
-  database: voidvault
-  username: root
-  password: password
-  pool-size: 10
+  # -------------------------------------------------------------------
+  # In-memory cache tuning. The DataCache is an LRU map that auto-evicts
+  # the least-recently-used entry when it grows past max-size, and a
+  # background scheduler evicts offline players every cleanup-interval
+  # seconds. Both knobs are safe to leave at their defaults.
+  # -------------------------------------------------------------------
+  cache:
+    # Soft upper bound on cached players. The cache holds at most this many
+    # PlayerVaultData instances; older entries are evicted (and, if dirty,
+    # flushed to storage first).
+    max-size: 1000
+    # How often the cleanup scheduler walks the cache and removes offline
+    # players, in seconds.
+    cleanup-interval-seconds: 300
+
+  # MYSQL settings (used for both pure-MYSQL mode AND as the persistent backup
+  # when storage.type is REDIS_PERSISTENT).
+  mysql:
+    host: localhost
+    port: 3306
+    database: voidvault
+    username: voidvault
+    password: change-me
+    pool-size: 30
+    # Maximum time to wait for a free connection from HikariCP. 3s instead
+    # of the default 30s so a saturated pool fails fast at the player
+    # command level rather than blocking the main thread for half a minute.
+    connection-timeout-ms: 3000
+    # How long a connection may be held before HikariCP logs a warning.
+    # Anything longer than this is almost certainly a leak that will exhaust
+    # the pool under sustained load.
+    leak-detection-threshold-ms: 10000
+
+  # REDIS settings (used when storage.type is REDIS or REDIS_PERSISTENT).
+  redis:
+    # Redis 8.0 server location
+    host: 127.0.0.1
+    port: 6379
+    password: ""           # leave blank if no AUTH
+    use-ssl: false
+    database: 0
+    timeout-ms: 5000
+
+    # Connection pool tuning
+    pool:
+      max-total: 48
+      max-idle: 16
+      min-idle: 8
+
+    # Identifier of this server in the network. When left blank we fall back to
+    # the local hostname (InetAddress.getLocalHost().getHostName()).
+    # Every node MUST have a unique id so the pub/sub filter can ignore the
+    # messages it published itself.
+    server-id: ""
+
+    # Cross-server invalidation broadcast channel.
+    invalidation-channel: "voidvault:invalidate"
+
+    # Prefix used for every player data key. The full key becomes
+    # `<prefix><uuid>` (e.g. "voidvault:player:9b2e...d5").
+    key-prefix: "voidvault:player:"
+
+    # TTL applied to player keys on every save. 30 days by default so that
+    # inactive players get reaped automatically. Set to 0 to disable TTL.
+    key-ttl-seconds: 2592000
+
+    # When true, every successful save publishes an INVALIDATE message so that
+    # other servers drop their locally cached copy of the same player's vault.
+    publish-on-save: true
+
+    # When true, this server reacts to INVALIDATE messages received from the
+    # channel. Set to false on servers that should never receive updates
+    # (typically only useful for read-only replicas).
+    invalidate-on-receive: true
+
+    # -------------------------------------------------------------------
+    # Persistent MySQL backup (only effective when storage.type is
+    # REDIS_PERSISTENT; ignored otherwise).
+    #
+    # Every successful Redis write is enqueued to a background dispatcher
+    # that mirrors the data to the MySQL instance configured under
+    # storage.mysql.*. Failed writes are retried until they succeed or the
+    # maximum attempt count is reached.
+    # -------------------------------------------------------------------
+    persistence:
+      # Master switch. When false the plugin behaves identically to a pure
+      # Redis deployment (this flag is also the auto-detection hint for the
+      # REDIS_PERSISTENT mode but you can leave it on and still choose
+      # storage.type: REDIS — the persistence layer simply stays inactive).
+      enabled: true
+
+      # Block the onDisable() thread until the queue has been drained. Strongly
+      # recommended; prevents data loss on graceful shutdowns.
+      persist-on-shutdown: true
+
+      # Maximum number of dispatch attempts before giving up on a job. After
+      # that the data is still in Redis and will be replayed the next time the
+      # player saves, so this is a soft limit rather than a data-loss trigger.
+      max-retry-attempts: 5
+
+      # Background dispatcher poll interval. Smaller values react faster to
+      # transient MySQL outages at the cost of slightly higher idle CPU.
+      retry-interval-seconds: 30
+
+      # On startup, after both Redis and MySQL are connected, read every row
+      # from MySQL and SET it into Redis so the network starts hot. Disabled by
+      # default because it can be expensive on very large databases — enable it
+      # only when you intentionally want full cache warming.
+      warm-cache-on-startup: false
+
+    # -------------------------------------------------------------------
+    # Compression. The plugin transparently compresses large page payloads
+    # with raw zlib before they are written to Redis (and, in
+    # REDIS_PERSISTENT mode, to MySQL). Compression is skipped for payloads
+    # below the min-size threshold because the framing overhead would erase
+    # any savings.
+    # -------------------------------------------------------------------
+    compression:
+      # Master switch. Disable for benchmarks if you want to measure the
+      # baseline cost; in production keep it on (3-6x shrink on serialised
+      # Bukkit NBT is the norm).
+      enabled: true
+      # zlib compression level, 1..9. 1 = best speed, 9 = best ratio.
+      # 6 is zlib's DEFAULT_COMPRESSION and a good all-round pick; raise to
+      # 9 only when storage cost matters more than CPU.
+      level: 6
+      # Skip compression for payloads smaller than this many bytes.
+      min-size: 256
+
+    # -------------------------------------------------------------------
+    # Diff sync & cross-server locking. When enabled the writer publishes an
+    # INVALIDATE_PAGE message containing only the touched page numbers, and
+    # takes a per-player distributed lock (SET NX PX) before the write so
+    # two nodes can never produce torn vaults.
+    # -------------------------------------------------------------------
+    diff-sync:
+      enabled: true
+      # Auto-expiry of the per-player write lock. Should comfortably exceed
+      # the slowest realistic MySQL persistence window; the writer releases
+      # it explicitly when the save finishes.
+      lock-ttl-ms: 5000
+      # If the pub/sub subscriber reconnects after a gap longer than this
+      # many seconds, it evicts every locally-cached player whose owner is
+      # currently online. The compensating assumption is "we lost messages
+      # during the outage, so the safest thing is to ask the storage layer
+      # to refresh the entry the next time anyone reads it".
+      reconnect-compensation-threshold-seconds: 30
+      # Maximum sleep between reconnect attempts when the subscriber loses
+      # its Redis connection. The actual backoff doubles on every failure,
+      # starting from 1s, capped at this value.
+      reconnect-max-backoff-seconds: 30
+
+    # -------------------------------------------------------------------
+    # Migration helpers. Keep the legacy single-blob format alongside the
+    # new per-page layout until every node in the network has been upgraded
+    # and you've confirmed nothing still reads the legacy key.
+    # -------------------------------------------------------------------
+    migration:
+      # When true, every save also writes a v1-compatible blob at
+      # {prefix}{uuid}:legacy. Disable once the rollout is complete to free
+      # the extra Redis memory.
+      keep-legacy-v1: false
 
 # Remote access settings
 remote-access:
@@ -22,12 +188,26 @@ remote-access:
   enabled: true
   # Cooldown in seconds between remote access uses
   cooldown-seconds: 60
-  # Economy fee charged per remote access (requires Vault)
-  economy-fee: 100.0
 
 # Auto-save interval (in minutes)
 # How often to save dirty player data to storage
 auto-save-interval: 5
+
+# -----------------------------------------------------------------------------
+# Graceful shutdown tuning. Used by VoidVaultPlugin.onDisable() when the
+# server is stopping. 30 seconds comfortably covers a 200-player saveAll()
+# on commodity hardware; lower it if you have tighter stop-timeout SLAs.
+# -----------------------------------------------------------------------------
+shutdown:
+  save-timeout-seconds: 30
+
+# Vault behavior knobs
+vault:
+  # Absolute upper bound on how many pages a single player can own in PAGED mode.
+  # Custom grants (setpages), permission tiers (voidvaults.page.N) and the
+  # default-pages value are all clamped to this number. Raise this if you want
+  # bigger vaults; lower it if you want a stricter cap. Must be >= 1.
+  max-pages: 10
 
 # Search/Filter settings
 search:
@@ -39,88 +219,92 @@ search:
   case-sensitive: false
 
 # GUI Titles - Customize vault inventory titles
-# Supports color codes (&a, &b, etc.) and placeholders
+# Supports MiniMessage markup: <gradient:#9CC3FF:#D9B3FF>…</gradient>, <bold>, etc.
+# Legacy & codes are still translated for backwards compatibility.
 gui-titles:
   # SIMPLE mode title
   # Placeholders: {player}
-  simple: "&5&lVault"
-  
+  simple: "<gradient:#9CC3FF:#D9B3FF><bold>✦ Vault</bold></gradient>"
+
   # PAGED mode title
-  # Placeholders: {player}, {page}, {maxPages}
-  paged: "&5&lVoidVault &8- &7Page {page}"
-  
+  # Placeholders: {player}, {page}, {max_pages}
+  # MiniMessage tags (use <key> form). {key} form also supported and is
+  # automatically rewritten to <key> at parse time.
+  paged: "<gradient:#9CC3FF:#D9B3FF><bold>✦ VoidVault</bold></gradient> <dark_gray>·</dark_gray> <gray>Page <page>/<max_pages></gray>"
+
   # Admin viewing another player's vault
-  # Placeholders: {player}, {target}, {page}, {maxPages}
-  admin: "&5&l{target}'s Vault &8- &7Page {page}"
+  # Placeholders: {player}, {target}, {page}, {max_pages}
+  admin: "<gradient:#9CC3FF:#D9B3FF><bold>✦ {target}'s Vault</bold></gradient> <dark_gray>·</dark_gray> <gray>Page <page>/<max_pages></gray>"
 
 # GUI Items - Customize the appearance of vault GUI elements
+# Every display-name and lore line is MiniMessage markup.
 items:
   # Item shown in locked slots (PAGED mode)
   locked-slot:
     material: RED_STAINED_GLASS_PANE
-    display-name: "&c&lLocked"
+    display-name: "<red><bold>✖ Locked</bold></red>"
     lore:
-      - "&7Upgrade your vault to"
-      - "&7unlock this slot!"
+      - "<gray>Upgrade your vault to</gray>"
+      - "<gray>unlock this slot!</gray>"
     glow: false
-  
+
   # Filler item for control bar slots without permissions
   filler-bar:
     material: GRAY_STAINED_GLASS_PANE
     display-name: " "
     lore: []
     glow: false
-  
+
   # Previous page navigation button
   previous-page:
     material: ARROW
-    display-name: "&e&lPrevious Page"
+    display-name: "<gradient:#9CC3FF:#D9B3FF><bold>◀ Previous Page</bold></gradient>"
     lore:
-      - "&7Click to go back"
+      - "<gray>Click to go back</gray>"
     glow: false
-  
+
   # Next page navigation button
   next-page:
     material: ARROW
-    display-name: "&e&lNext Page"
+    display-name: "<gradient:#9CC3FF:#D9B3FF><bold>Next Page ▶</bold></gradient>"
     lore:
-      - "&7Click to continue"
+      - "<gray>Click to continue</gray>"
     glow: false
-  
-  # Sort button - organizes items in the current page
+
+  # Sort button - organizes items in the current page by category then name
   sort-button:
     material: HOPPER
-    display-name: "&6&lSort Items"
+    display-name: "<gradient:#9CC3FF:#D9B3FF><bold>⇅ Sort Items</bold></gradient>"
     lore:
-      - "&7Click to organize this page"
-      - "&7Groups and sorts items"
+      - "<gray>Click to organize this page</gray>"
+      - "<dark_gray>Grouped by category, sorted by name</dark_gray>"
     glow: false
-  
+
   # Quick deposit button - deposits matching items from inventory
   quick-deposit:
     material: CHEST
-    display-name: "&a&lQuick Deposit"
+    display-name: "<gradient:#9CC3FF:#D9B3FF><bold>⊕ Quick Deposit</bold></gradient>"
     lore:
-      - "&7Click to deposit items"
-      - "&7Stacks into existing items"
+      - "<gray>Click to deposit matching stacks</gray>"
+      - "<dark_gray>Fills existing stacks first</dark_gray>"
     glow: false
-  
+
   # Search/Filter button - filters items by name
   search-button:
     material: COMPASS
-    display-name: "&b&lSearch Items"
+    display-name: "<gradient:#9CC3FF:#D9B3FF><bold>◎ Search Items</bold></gradient>"
     lore:
-      - "&7Click to filter items"
-      - "&7Type item name in chat"
+      - "<gray>Click to filter items</gray>"
+      - "<dark_gray>Type item name in chat</dark_gray>"
     glow: false
-  
+
   # Filtered slot item - shown for non-matching items during search
   filtered-slot:
     material: LIGHT_GRAY_STAINED_GLASS_PANE
-    display-name: "&7&oFiltered"
+    display-name: "<gray><italic>Filtered</italic></gray>"
     lore:
-      - "&7This item doesn't match"
-      - "&7your search query"
+      - "<gray>Hidden by the active search.</gray>"
+      - "<gray>Clear the filter to interact.</gray>"
     glow: false
 
 # Default values when no permissions are set
@@ -129,13 +313,16 @@ defaults:
   simple:
     # Default number of slots (9, 18, 27, 36, 45, or 54)
     slots: 27
-  
+
   # PAGED mode defaults
   paged:
     # Default number of slots (9, 18, 27, 36, 45, or 50)
     slots: 50
-    # Default number of pages (1-5, maximum is 5)
-    pages: 1
+    # Default number of pages granted to a player that has no explicit
+    # voidvaults.page.* permission. Leave at 0 to inherit vault.max-pages
+    # automatically (recommended). Any value larger than vault.max-pages is
+    # clamped to vault.max-pages.
+    pages: 0
 
 # Feature toggles
 features:
@@ -147,3 +334,115 @@ features:
   search-enabled: true
   # Enable locked slot indicators
   locked-slots-enabled: true
+
+# -----------------------------------------------------------------------------
+# Search GUI
+# The 27-slot overlay that lets players pick a quick search filter
+# (diamond / iron / …) or type their own. Every label below is MiniMessage
+# markup so authors can mix <gradient>, <bold>, <color>, etc.
+# -----------------------------------------------------------------------------
+search-gui:
+  # Inventory title (MiniMessage).
+  title: "<gradient:#9CC3FF:#D9B3FF><bold>◎ Search Vault</bold></gradient>"
+
+  # Glass panes filling every slot before the buttons are drawn. Keeping it
+  # separate from the existing filler-bar item means the search overlay can
+  # use a slightly darker shade without changing the main vault look.
+  filler:
+    material: GRAY_STAINED_GLASS_PANE
+    display-name: " "
+    lore: []
+
+  # Quick-search buttons. The `query` field is what the GUI passes to the
+  # search manager when the button is clicked; the `slot` field must be unique
+  # within the 27-slot overlay. The order in the YAML does not matter — slots
+  # are resolved via the `slot` key. Removing any entry just hides that
+  # button, leaving the slot as filler.
+  quick-options:
+    - id: diamond
+      slot: 10
+      material: DIAMOND
+      query: "diamond"
+      display-name: "<aqua><bold>◇ Diamond Items</bold></aqua>"
+      lore:
+        - "<gray>Search for any diamond item.</gray>"
+      glow: false
+    - id: iron
+      slot: 11
+      material: IRON_INGOT
+      query: "iron"
+      display-name: "<white><bold>◇ Iron Items</bold></white>"
+      lore:
+        - "<gray>Search for any iron item.</gray>"
+      glow: false
+    - id: gold
+      slot: 12
+      material: GOLD_INGOT
+      query: "gold"
+      display-name: "<yellow><bold>◇ Gold Items</bold></yellow>"
+      lore:
+        - "<gray>Search for any gold item.</gray>"
+      glow: false
+    - id: netherite
+      slot: 13
+      material: NETHERITE_INGOT
+      query: "netherite"
+      display-name: "<dark_gray><bold>◇ Netherite Items</bold></dark_gray>"
+      lore:
+        - "<gray>Search for any netherite item.</gray>"
+      glow: true
+    - id: tools-weapons
+      slot: 14
+      material: WOODEN_SWORD
+      query: "sword pickaxe axe shovel hoe"
+      display-name: "<gold><bold>◇ Tools &amp; Weapons</bold></gold>"
+      lore:
+        - "<gray>Search for tools and weapons.</gray>"
+      glow: false
+    - id: armor
+      slot: 15
+      material: DIAMOND_CHESTPLATE
+      query: "helmet chestplate leggings boots"
+      display-name: "<light_purple><bold>◇ Armor</bold></light_purple>"
+      lore:
+        - "<gray>Search for armour pieces.</gray>"
+      glow: false
+    - id: blocks
+      slot: 16
+      material: COBBLESTONE
+      query: "stone dirt cobblestone"
+      display-name: "<gray><bold>◇ Blocks</bold></gray>"
+      lore:
+        - "<gray>Search for common building blocks.</gray>"
+      glow: false
+
+  # "Type your own" entry. Same shape as a quick-option, but the GUI treats
+  # it as the prompt — instead of running a search, it asks the player to
+  # type in chat.
+  custom-search:
+    slot: 22
+    material: NAME_TAG
+    display-name: "<gradient:#9CC3FF:#D9B3FF><bold>✎ Custom Search</bold></gradient>"
+    lore:
+      - "<gray>Click to enter your own query.</gray>"
+      - "<dark_gray>Type the item name in chat.</dark_gray>"
+    glow: false
+
+  # Clears the active search filter (no query, no prompt).
+  clear-filter:
+    slot: 24
+    material: BARRIER
+    display-name: "<red><bold>✕ Clear Filter</bold></red>"
+    lore:
+      - "<gray>Remove the current filter and</gray>"
+      - "<gray>show every item again.</gray>"
+    glow: false
+
+  # Returns to the vault without changing the search state.
+  cancel:
+    slot: 26
+    material: RED_STAINED_GLASS_PANE
+    display-name: "<red><bold>↩ Cancel</bold></red>"
+    lore:
+      - "<gray>Return to the vault.</gray>"
+    glow: false

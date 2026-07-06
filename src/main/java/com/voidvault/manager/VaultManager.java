@@ -7,6 +7,7 @@ import com.voidvault.gui.PagedVaultGUI;
 import com.voidvault.gui.SimpleVaultGUI;
 import com.voidvault.gui.VaultGUI;
 import com.voidvault.model.PlayerVaultData;
+import com.voidvault.model.VaultDataCloner;
 import com.voidvault.storage.DataCache;
 import com.voidvault.storage.StorageManager;
 import com.voidvault.util.SchedulerUtil;
@@ -118,11 +119,16 @@ public class VaultManager {
                         logger.warning("Storage returned null data for " + player.getName() + ", creating empty vault");
                         data = PlayerVaultData.createEmpty(playerId);
                     }
-                    
-                    // Cache the loaded data
-                    dataCache.put(playerId, data);
+
+                    // Defensive deep copy before crossing the I/O thread →
+                    // main thread boundary and before stashing in the cache.
+                    // Both the storage layer and DataCache are shared between
+                    // threads; cloning here ensures the main-thread reference
+                    // is fully independent of any I/O buffers.
+                    PlayerVaultData cached = VaultDataCloner.deepClone(data);
+                    dataCache.put(playerId, cached);
                     logger.fine("Cached vault data for " + player.getName());
-                    return data;
+                    return cached;
                 })
                 .exceptionally(ex -> {
                     logger.severe("=== Vault Data Loading Failure ===");
@@ -130,7 +136,7 @@ public class VaultManager {
                     logger.severe("Error Type: " + ex.getClass().getSimpleName());
                     logger.severe("Error Message: " + (ex.getMessage() != null ? ex.getMessage() : "Unknown error"));
                     logger.severe("Stack trace:");
-                    ex.printStackTrace();
+                    logger.log(java.util.logging.Level.SEVERE, "Exception details:", ex);
                     logger.severe("Creating empty vault as fallback");
                     logger.severe("===================================");
                     
@@ -205,7 +211,7 @@ public class VaultManager {
                     logger.severe("Error Type: " + ex.getClass().getSimpleName());
                     logger.severe("Error Message: " + (ex.getMessage() != null ? ex.getMessage() : "Unknown error"));
                     logger.severe("Stack trace:");
-                    ex.printStackTrace();
+                    logger.log(java.util.logging.Level.SEVERE, "Exception details:", ex);
                     logger.severe("===================================");
                     
                     messageManager.send(player, "error.load-failed");
@@ -252,11 +258,13 @@ public class VaultManager {
                         logger.warning("Storage returned null data for UUID " + targetUUID + ", creating empty vault");
                         data = PlayerVaultData.createEmpty(targetUUID);
                     }
-                    
-                    // Cache the loaded data
-                    dataCache.put(targetUUID, data);
+
+                    // Defensive deep copy before caching — see openVault()
+                    // for the rationale.
+                    PlayerVaultData cached = VaultDataCloner.deepClone(data);
+                    dataCache.put(targetUUID, cached);
                     logger.fine("Cached vault data for target UUID " + targetUUID);
-                    return data;
+                    return cached;
                 })
                 .exceptionally(ex -> {
                     logger.severe("=== Admin Vault Data Loading Failure ===");
@@ -265,7 +273,7 @@ public class VaultManager {
                     logger.severe("Error Type: " + ex.getClass().getSimpleName());
                     logger.severe("Error Message: " + (ex.getMessage() != null ? ex.getMessage() : "Unknown error"));
                     logger.severe("Stack trace:");
-                    ex.printStackTrace();
+                    logger.log(java.util.logging.Level.SEVERE, "Exception details:", ex);
                     logger.severe("Creating empty vault as fallback");
                     logger.severe("=========================================");
                     
@@ -337,7 +345,7 @@ public class VaultManager {
                     logger.severe("Error Type: " + ex.getClass().getSimpleName());
                     logger.severe("Error Message: " + (ex.getMessage() != null ? ex.getMessage() : "Unknown error"));
                     logger.severe("Stack trace:");
-                    ex.printStackTrace();
+                    logger.log(java.util.logging.Level.SEVERE, "Exception details:", ex);
                     logger.severe("==========================================");
                     
                     messageManager.send(admin, "error.load-failed");
@@ -441,7 +449,7 @@ public class VaultManager {
                 })
                 .exceptionally(ex -> {
                     logger.severe("Failed to save vault data for " + player.getName() + ": " + ex.getMessage());
-                    ex.printStackTrace();
+                    logger.log(java.util.logging.Level.SEVERE, "Exception details:", ex);
                     return null;
                 });
         }
@@ -480,61 +488,96 @@ public class VaultManager {
     
     /**
      * Navigate to a different page in the player's vault.
-     * Saves the current page, closes the current GUI, and opens the new page.
+     * <p>
+     * Saves the current page, then either renders the new page in-place on
+     * the existing inventory (preferred — keeps the player's hotbar slot
+     * and cursor item stable) or falls back to a close-then-reopen cycle.
+     * The in-place path avoids the bug where clicking Next/Previous Page
+     * would teleport the player's cursor back to the middle slot.
+     * </p>
      *
      * @param player     The player navigating pages
      * @param targetPage The page number to navigate to
      */
     public void navigateToPage(Player player, int targetPage) {
         UUID playerId = player.getUniqueId();
-        
+
         // Validate target page
         if (targetPage < 1) {
             logger.warning("Invalid target page " + targetPage + " for " + player.getName());
             return;
         }
-        
+
+        // Clamp to the player's actual page allowance so navigation cannot
+        // walk past pages the player does not own.
+        int maxAllowedPages = permissionManager.getMaxPages(player);
+        if (targetPage > maxAllowedPages) {
+            logger.fine("Refusing to navigate " + player.getName() + " to page " + targetPage
+                    + " (max " + maxAllowedPages + ")");
+            return;
+        }
+
         // Get the current GUI
         VaultGUI currentGui = openGuis.get(playerId);
-        
+
         if (currentGui == null) {
             logger.warning("No open GUI found for " + player.getName() + " during page navigation");
             return;
         }
-        
-        // Mark player as navigating to prevent close event from interfering
+
+        // Mark player as navigating so the close handler ignores the
+        // extremely brief moment where the inventory briefly closes if we
+        // fall back to the close-then-reopen path.
         navigatingPlayers.add(playerId);
-        
+
         try {
-            // Save the current page
+            // Save the current page before swapping contents.
             currentGui.saveInventoryToData();
-            
-            // Close the current inventory
+
+            // Fast path: in-place render for two PAGED-mode GUIs that share
+            // inventory size (they always do — 54-slot).
+            if (currentGui instanceof PagedVaultGUI currentPaged) {
+                // Reuse the player's current inventory for the new page so
+                // that the cursor and hotbar slot are not reset.
+                currentPaged.setPage(targetPage);
+                currentPaged.render();
+                // Force the client to refresh the contents so the new items
+                // and arrows actually appear immediately.
+                player.updateInventory();
+                return;
+            }
+
+            // Fallback path (e.g. SIMPLE mode swapping pages). This is rare
+            // because SIMPLE mode only ever has one page, but it keeps the
+            // behaviour correct if anything else ever calls navigateToPage
+            // with a non-PAGED GUI.
+            final VaultGUI newGui = createGUI(player, targetPage);
+            newGui.render();
             player.closeInventory();
-            
-            // Schedule the new page to open on the next tick
-            // This ensures the close event completes first
             SchedulerUtil.runSync(plugin, player, () -> {
                 try {
-                    // Create and open the new page
-                    VaultGUI newGui = createGUI(player, targetPage);
-                    newGui.render();
                     openGuis.put(playerId, newGui);
                     player.openInventory(newGui.getInventory());
                 } catch (Exception ex) {
-                    logger.severe("Failed to open page " + targetPage + " for " + player.getName() + ": " + ex.getMessage());
-                    ex.printStackTrace();
+                    logger.severe("Failed to open page " + targetPage + " for "
+                            + player.getName() + ": " + ex.getMessage());
+                    logger.log(java.util.logging.Level.SEVERE, "Exception details:", ex);
                     messageManager.send(player, "error.load-failed");
                 } finally {
-                    // Remove navigation flag
                     navigatingPlayers.remove(playerId);
                 }
             });
+            return;
         } catch (Exception ex) {
-            // Ensure navigation flag is cleared on error
             navigatingPlayers.remove(playerId);
             logger.severe("Error during page navigation for " + player.getName() + ": " + ex.getMessage());
             ex.printStackTrace();
+            return;
+        } finally {
+            // For the in-place path above the flag was already left set so
+            // we still need to clear it here. (The finally clause only
+            // fires when the in-place path returned normally.)
+            navigatingPlayers.remove(playerId);
         }
     }
     
@@ -622,9 +665,12 @@ public class VaultManager {
     public void initiateSearch(Player player, int page) {
         // Close the current vault
         player.closeInventory();
-        
-        // Open search GUI
-        com.voidvault.gui.SearchGUI searchGUI = new com.voidvault.gui.SearchGUI(player, page, this);
+
+        // Open search GUI. Pass the configuration + message managers so the
+        // overlay can pull its title, icons, lore and chat prompts from the
+        // plugin's configurable sources rather than hardcoded strings.
+        com.voidvault.gui.SearchGUI searchGUI = new com.voidvault.gui.SearchGUI(
+                player, page, this, configManager, messageManager);
         openSearchGuis.put(player.getUniqueId(), searchGUI);
         searchGUI.open();
     }

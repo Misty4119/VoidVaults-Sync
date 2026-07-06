@@ -1,6 +1,8 @@
 package com.voidvault.storage;
 
 import com.voidvault.model.PlayerVaultData;
+import com.zaxxer.hikari.HikariPoolMXBean;
+import redis.clients.jedis.JedisPool;
 
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -51,4 +53,54 @@ public interface StorageManager {
      * @return A CompletableFuture that completes when initialization finishes
      */
     CompletableFuture<Void> initialize();
+
+    // ---------------------------------------------------------------------
+    // Metrics hooks — default to "no metrics" so existing implementations
+    // (YamlStorage, MySqlStorage, etc.) keep compiling without changes.
+    // Only MySqlStorage / RedisStorageManager / RedisBackedMySqlStorage
+    // override these to expose pool state to MetricsUtil.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Underlying HikariCP MX bean, or {@code null} when this storage backend
+     * does not use MySQL. Consumed by the bStats / daily-stats metrics
+     * pipeline.
+     */
+    default HikariPoolMXBean getHikariPoolMetrics() {
+        return null;
+    }
+
+    /**
+     * Underlying Jedis pool, or {@code null} when this storage backend does
+     * not use Redis.
+     */
+    default JedisPool getJedisPoolMetrics() {
+        return null;
+    }
+
+    /**
+     * Backend identifier used by the bStats storage_type DrilldownPie chart.
+     * Implementations should return one of:
+     * {@code YAML}, {@code MYSQL}, {@code REDIS}, {@code REDIS_PERSISTENT}.
+     */
+    default String getBackendTypeName() {
+        return "UNKNOWN";
+    }
+
+    /**
+     * Latency histogram for save operations. Implementations that do not
+     * track latency should still return a histogram instance so the daily
+     * log output stays consistent (it will simply report "no samples").
+     */
+    default LatencyHistogram getSaveLatencyHistogram() {
+        return new LatencyHistogram("save");
+    }
+
+    /**
+     * Latency histogram for load operations. See
+     * {@link #getSaveLatencyHistogram()}.
+     */
+    default LatencyHistogram getLoadLatencyHistogram() {
+        return new LatencyHistogram("load");
+    }
 }

@@ -143,7 +143,7 @@ public class VaultInventoryListener implements Listener {
         // Close the vault (saves data and removes from tracking)
         vaultManager.closeVault(player).exceptionally(ex -> {
             logger.severe("Failed to close vault for " + player.getName() + ": " + ex.getMessage());
-            ex.printStackTrace();
+            logger.log(java.util.logging.Level.SEVERE, "Exception details:", ex);
             return null;
         });
     }

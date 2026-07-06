@@ -41,8 +41,8 @@ public class PagedVaultGUI extends VaultGUI {
         SLOT_PREVIOUS_PAGE, SLOT_SORT, SLOT_QUICK_DEPOSIT, SLOT_SEARCH, SLOT_NEXT_PAGE
     );
     
-    private final int maxSlots;
-    private final int maxPages;
+    private int maxSlots;
+    private int maxPages;
     private com.voidvault.manager.VaultManager vaultManager; // Optional, for page navigation
     private String searchQuery; // Active search filter
     
@@ -82,8 +82,8 @@ public class PagedVaultGUI extends VaultGUI {
         int maxSlots = permissionManager.getMaxSlots(player);
         int maxPages = permissionManager.getMaxPages(player);
         
-        // Get title from config
-        String title = configManager.getPagedModeTitle(player.getName(), page, maxPages);
+        // Get title from config (MiniMessage Component)
+        net.kyori.adventure.text.Component title = configManager.getPagedModeTitle(player.getName(), page, maxPages);
         
         // Create fixed 54-slot inventory
         Inventory inventory = Bukkit.createInventory(player, 54, title);
@@ -262,15 +262,23 @@ public class PagedVaultGUI extends VaultGUI {
     @Override
     public void handleClick(InventoryClickEvent event) {
         int slot = event.getRawSlot();
-        
+
         // If clicking outside the vault inventory, allow it
         if (slot < 0 || slot >= 54) {
             return;
         }
-        
-        // Check if clicking a control bar slot
+
+        // Check if clicking a control bar slot. We also guard against
+        // clicking on a "filler bar" button placeholder so the inventory
+        // never reports a no-op click on a disabled navigation slot.
         if (CONTROL_BAR_SLOTS.contains(slot)) {
             event.setCancelled(true);
+            ItemStack clickedItem = inventory.getItem(slot);
+            if (clickedItem == null || isFillerPlaceholder(clickedItem)) {
+                // Disabled control-bar slot (e.g. Previous Page on page 1).
+                // We have already cancelled the click — nothing else to do.
+                return;
+            }
             handleButtonClick(slot);
             return;
         }
@@ -339,17 +347,23 @@ public class PagedVaultGUI extends VaultGUI {
     
     /**
      * Handle the Sort button click.
-     * Organizes items in the current page by grouping and sorting.
+     * Re-renders the page after grouping items into logical categories
+     * (weapons, tools, armour, …) and sorting each group by material name.
+     * Empty trailing slots are normal — they are simply never written to.
      */
     private void handleSort() {
         saveInventoryToData();
-        
+
         VaultPage currentPage = getCurrentPage();
-        currentPage.sort();
-        
+        // Use the immutable sorted() form and write it back into vault data
+        // explicitly. The deprecated in-place sort() helper remains for
+        // binary compatibility but is no longer needed here.
+        VaultPage sorted = currentPage.sorted();
+        vaultData.setPage(page, sorted);
+
         render();
         markDirty();
-        
+
         player.playSound(player.getLocation(), org.bukkit.Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 0.5f, 1.0f);
     }
     
@@ -589,9 +603,13 @@ public class PagedVaultGUI extends VaultGUI {
     private void navigateToPage(int targetPage) {
         // Play page turn sound
         player.playSound(player.getLocation(), org.bukkit.Sound.ITEM_BOOK_PAGE_TURN, 0.7f, 1.0f);
-        
+
         if (vaultManager != null) {
-            // Use VaultManager for proper page navigation
+            // Use VaultManager for proper page navigation. The manager keeps
+            // the player's existing top inventory alive across the swap so
+            // the cursor and hotbar slot are preserved (preventing the
+            // cursor from jumping back to the middle row on every page
+            // change).
             vaultManager.navigateToPage(player, targetPage);
         } else {
             // Fallback: Save and close without navigation
@@ -599,6 +617,19 @@ public class PagedVaultGUI extends VaultGUI {
             saveInventoryToData();
             player.closeInventory();
         }
+    }
+
+    /**
+     * Switch this GUI to a different page number without re-creating the
+     * underlying inventory. Used by
+     * {@link com.voidvault.manager.VaultManager#navigateToPage} so the
+     * player's hotbar slot and cursor item are preserved across page
+     * navigation (instead of snapping back to the middle slot).
+     *
+     * @param targetPage The new page number (1-indexed).
+     */
+    public void setPage(int targetPage) {
+        this.page = targetPage;
     }
     
     @Override
@@ -646,13 +677,23 @@ public class PagedVaultGUI extends VaultGUI {
      */
     private boolean isFilteredPlaceholder(ItemStack item) {
         if (item == null) return false;
-        
+
         // Check if it matches the filtered slot item
         ItemStack filteredItem = configManager.getFilteredSlotItem().toItemStack();
-        return item.getType() == filteredItem.getType() && 
-               item.hasItemMeta() && 
+        return item.getType() == filteredItem.getType() &&
+               item.hasItemMeta() &&
                filteredItem.hasItemMeta() &&
                item.getItemMeta().getDisplayName().equals(filteredItem.getItemMeta().getDisplayName());
+    }
+
+    /**
+     * Check if an item is the filler-bar placeholder (gray stained glass pane)
+     * used to disable a control-bar slot such as "Previous Page" on page 1.
+     */
+    private boolean isFillerPlaceholder(ItemStack item) {
+        if (item == null) return false;
+        ItemStack filler = configManager.getFillerBarItem().toItemStack();
+        return item.getType() == filler.getType();
     }
     
     /**

@@ -1,9 +1,10 @@
 name: VoidVaults
-version: 1.1.0
+version: 2.1.0
 main: com.voidvault.VoidVaultPlugin
-api-version: '1.17'
+api-version: '26.1.2'
+folia-supported: true
 author: VoidVault Team
-description: Modern, performance-first Ender Chest replacement
+description: Modern, performance-first Ender Chest replacement for Folia 26.1.2 with Redis 8.0 multi-server sync
 website: https://example.com
 
 softdepend: [Vault, PlaceholderAPI]
@@ -15,7 +16,7 @@ commands:
     aliases: [vvs, vv]
   echest:
     description: Open your vault remotely
-    usage: /echest
+    usage: /echest [page]
     aliases: [pv, vault]
 
 permissions:
@@ -40,7 +41,7 @@ permissions:
   voidvaults.slots.52:
     description: Access to 52 slots (PAGED mode max)
     default: false
-  
+
   voidvaults.page.1:
     description: Access to page 1
     default: true
@@ -54,16 +55,31 @@ permissions:
     description: Access to page 4
     default: false
   voidvaults.page.5:
-    description: Access to page 5 (maximum)
+    description: Access to page 5
     default: false
-  
+  voidvaults.page.6:
+    description: Access to page 6
+    default: false
+  voidvaults.page.7:
+    description: Access to page 7
+    default: false
+  voidvaults.page.8:
+    description: Access to page 8
+    default: false
+  voidvaults.page.9:
+    description: Access to page 9
+    default: false
+  voidvaults.page.10:
+    description: Access to page 10
+    default: false
+
   voidvaults.remote:
     description: Use remote access command
     default: op
   voidvaults.remote.bypasscooldown:
     description: Bypass remote access cooldown
     default: op
-  
+
   voidvaults.admin.openother:
     description: Open other players' vaults
     default: op

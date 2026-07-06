@@ -203,6 +203,11 @@ public class YamlStorage implements StorageManager {
         asyncExecutor.shutdown();
     }
 
+    @Override
+    public String getBackendTypeName() {
+        return "YAML";
+    }
+
     /**
      * Gets the file path for a player's data.
      *

@@ -51,8 +51,8 @@ public class SimpleVaultGUI extends VaultGUI {
         // Calculate inventory size based on permissions
         int maxSlots = calculateInventorySize(player, permissionManager);
         
-        // Get title from config
-        String title = configManager.getSimpleModeTitle(player.getName());
+        // Get title from config (MiniMessage Component)
+        net.kyori.adventure.text.Component title = configManager.getSimpleModeTitle(player.getName());
         
         // Create the inventory
         int rows = maxSlots / 9;

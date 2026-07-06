@@ -18,13 +18,23 @@ import com.voidvault.storage.DataCache;
 import com.voidvault.storage.MySqlStorage;
 import com.voidvault.storage.StorageManager;
 import com.voidvault.storage.YamlStorage;
+import com.voidvault.storage.redis.RedisBackedMySqlStorage;
+import com.voidvault.storage.redis.RedisCacheInvalidator;
+import com.voidvault.storage.redis.RedisConfig;
+import com.voidvault.storage.redis.RedisConnectionManager;
+import com.voidvault.storage.redis.RedisStorageManager;
+import com.voidvault.util.MetricsUtil;
 import com.voidvault.util.SchedulerUtil;
 import org.bstats.bukkit.Metrics;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 
 /**
@@ -44,10 +54,11 @@ public class VoidVaultPlugin extends JavaPlugin {
     // Storage
     private DataCache dataCache;
     private StorageManager storageManager;
-    
+    private RedisCacheInvalidator redisInvalidator;
+
     // Integrations
     private PlaceholderAPIHook placeholderAPIHook;
-    
+
     // Auto-save task
     private AutoSaveTask autoSaveTask;
 
@@ -55,33 +66,38 @@ public class VoidVaultPlugin extends JavaPlugin {
     public void onEnable() {
         getLogger().info("VoidVault is enabling...");
         
-        try {
+try {
             // Initialize SchedulerUtil for Folia detection
             SchedulerUtil.init(this);
-            
+
             // Initialize all managers
             initializeManagers();
-            
+
             // Initialize storage
             initializeStorage();
-            
+
             // Register event listeners
             registerListeners();
-            
+
             // Register commands
             registerCommands();
-            
+
             // Set up integrations
             setupIntegrations();
-            
+
             // Start auto-save task
             startAutoSave();
-            
+
             // Initialize bStats
             initializeMetrics();
-            
+
+            // Start the periodic DataCache cleanup scheduler (P0-1). Started
+            // last so the storage manager is already in place when the
+            // cleanup pass tries to flush dirty entries.
+            startDataCacheCleanup();
+
             getLogger().info("VoidVault enabled successfully!");
-            
+
         } catch (Exception e) {
             getLogger().log(Level.SEVERE, "Failed to enable VoidVault", e);
             getServer().getPluginManager().disablePlugin(this);
@@ -91,33 +107,57 @@ public class VoidVaultPlugin extends JavaPlugin {
     @Override
     public void onDisable() {
         getLogger().info("VoidVault is disabling...");
-        
+
         try {
-            // Stop auto-save task
+            // Phase 1: stop the Redis invalidation subscriber before
+            // tearing down the connection pool so we don't drop a half-
+            // closed Jedis connection.
+            if (redisInvalidator != null) {
+                redisInvalidator.close();
+                getLogger().info("[Shutdown] Phase 1/3: Redis subscriber stopped.");
+            }
+
+            // Stop auto-save task so it cannot race saveAll().
             if (autoSaveTask != null) {
                 autoSaveTask.cancel();
                 getLogger().info("Auto-save task stopped.");
             }
-            
-            // Perform synchronous save of all cached data
+
+            // Stop DataCache cleanup scheduler before we tear the storage
+            // manager down (the cleanup tick calls savePlayerData).
+            if (dataCache != null) {
+                dataCache.stopCleanup();
+            }
+
+            // Phase 2: drain the in-memory cache to storage.
             if (storageManager != null && dataCache != null) {
-                getLogger().info("Saving all vault data...");
+                getLogger().info("[Shutdown] Phase 2/3: Flushing dirty cache to storage "
+                        + "(size=" + dataCache.size() + ", dirty=" + dataCache.dirtyCount() + ")...");
                 saveAllDataSync();
-                getLogger().info("All vault data saved successfully.");
+                getLogger().info("[Shutdown] Phase 2/3: Flush complete.");
             }
-            
-            // Close storage manager
+
+            // Emit a final daily-stats block so the operator has a
+            // snapshot of the live pool state right before the pools close.
+            MetricsUtil.runDailyStatsNow();
+
+            // Phase 3: tear down storage manager (closes Hikari + Jedis pools).
             if (storageManager != null) {
+                getLogger().info("[Shutdown] Phase 3/3: Closing pools...");
                 storageManager.close();
+                getLogger().info("[Shutdown] Phase 3/3: Pools closed.");
             }
-            
+
+            // Stop the bStats / daily logger scheduler.
+            MetricsUtil.shutdown();
+
             // Stop cooldown cleanup task
             if (cooldownManager != null) {
                 cooldownManager.shutdown();
             }
-            
+
             getLogger().info("VoidVault disabled successfully.");
-            
+
         } catch (Exception e) {
             getLogger().log(Level.SEVERE, "Error during plugin shutdown", e);
         }
@@ -136,8 +176,10 @@ public class VoidVaultPlugin extends JavaPlugin {
         messageManager = new MessageManager(this);
         messageManager.load();
         
-        // Data cache
-        dataCache = new DataCache();
+        // Data cache (P0-1: LRU + storage-aware eviction). The storageManager
+        // reference is wired in after initializeStorage() via
+        // dataCache.setStorageManager(...) below.
+        dataCache = new DataCache(getLogger(), resolveCacheMaxSize(), null);
         
         // Permission manager (needs dataCache, so we'll initialize it after storage)
         // Temporarily set to null, will be initialized in initializeStorage()
@@ -159,12 +201,24 @@ public class VoidVaultPlugin extends JavaPlugin {
         getLogger().info("Initializing storage...");
         
         String storageType = configManager.getStorageType();
-        
+
         // Create appropriate storage implementation
         storageManager = switch (storageType) {
             case "MYSQL" -> {
                 getLogger().info("Using MySQL storage backend");
                 yield new MySqlStorage(this, dataCache);
+            }
+            case "REDIS" -> {
+                getLogger().info("Using Redis 8.0 storage backend (cross-server sync)");
+                RedisConfig redisConfig = RedisConfig.fromConfig(this);
+                RedisConnectionManager redisConn = new RedisConnectionManager(redisConfig, this);
+                yield new RedisStorageManager(this, dataCache, redisConn);
+            }
+            case "REDIS_PERSISTENT" -> {
+                getLogger().info("Using Redis 8.0 primary + MySQL persistent backup");
+                RedisConfig redisConfig = RedisConfig.fromConfig(this);
+                RedisConnectionManager redisConn = new RedisConnectionManager(redisConfig, this);
+                yield new RedisBackedMySqlStorage(this, dataCache, redisConn);
             }
             case "YAML" -> {
                 getLogger().info("Using YAML storage backend");
@@ -175,24 +229,106 @@ public class VoidVaultPlugin extends JavaPlugin {
                 yield new YamlStorage(this, dataCache);
             }
         };
-        
-        // Initialize storage asynchronously
-        storageManager.initialize()
-            .exceptionally(ex -> {
-                getLogger().log(Level.SEVERE, "Failed to initialize storage", ex);
-                return null;
-            });
-        
+
+        // Initialize storage synchronously with timeout.
+        // This ensures MySQL/Redis are ready before the plugin starts
+        // accepting commands and events.
+        try {
+            storageManager.initialize()
+                .orTimeout(30, TimeUnit.SECONDS)
+                .thenRun(() -> {
+                    // Start the Redis pub/sub invalidator for any storage backend
+                    // that exposes a Redis connection (pure Redis or the hybrid
+                    // Redis+MySQL manager). Doing it after initialize() guarantees
+                    // the Jedis pool has already PINGed successfully.
+                    RedisConnectionManager conn = null;
+                    if (storageManager instanceof RedisStorageManager redisStorage) {
+                        conn = redisStorage.getConnection();
+                    } else if (storageManager instanceof RedisBackedMySqlStorage hybrid) {
+                        conn = hybrid.getRedisConnection();
+                    }
+                    if (conn != null) {
+                        RedisConfig cfg = RedisConfig.fromConfig(this);
+                        redisInvalidator = new RedisCacheInvalidator(conn, dataCache, this);
+                        redisInvalidator.start();
+                        getLogger().info("Redis invalidation subscriber started (server-id="
+                                + cfg.getServerId() + ", channel=" + cfg.getInvalidationChannel() + ")");
+                    }
+                })
+                .join();
+        } catch (Exception ex) {
+            String reason = ex.getCause() != null ? ex.getCause().getMessage() : ex.getMessage();
+            getLogger().severe("Failed to initialize storage: " + reason);
+            getLogger().warning("Falling back to YAML storage to prevent data loss");
+            storageManager = new YamlStorage(this, dataCache);
+            storageManager.initialize().join();
+        }
+
         // Initialize permission manager (needs dataCache)
         permissionManager = new PermissionManager(configManager, dataCache);
-        
+
         // Initialize vault manager (depends on storage and permission manager)
-        vaultManager = new VaultManager(this, configManager, messageManager, 
+        vaultManager = new VaultManager(this, configManager, messageManager,
             permissionManager, storageManager, dataCache);
-        
+
+        // Now that the storage manager exists, inject it into the cache so
+        // LRU eviction can flush dirty entries. bStats charts are
+        // registered at the same point so they observe a fully-initialised
+        // pool state from the first collection onwards.
+        wireStorageToCache();
+
         getLogger().info("Storage initialized.");
     }
-    
+
+    /**
+     * Wire the storage manager into the DataCache so LRU eviction can flush
+     * dirty entries before dropping them. Also register bStats metrics now
+     * that all pool references are stable.
+     */
+    private void wireStorageToCache() {
+        if (dataCache != null && storageManager != null) {
+            dataCache.setStorageManager(storageManager);
+        }
+        MetricsUtil.registerChartsOnly(this, dataCache, storageManager);
+    }
+
+    /**
+     * Read the configured LRU max-size for the DataCache. Defaults to 1000
+     * so a misconfigured YAML file never disables the upper bound.
+     */
+    private int resolveCacheMaxSize() {
+        try {
+            return Math.max(1, getConfig().getInt("storage.cache.max-size", 1000));
+        } catch (Exception e) {
+            return 1000;
+        }
+    }
+
+    /**
+     * Read the configured cleanup interval (seconds) for the DataCache.
+     * Defaults to 300s (5 minutes) — the same cadence used by PlayerVaultsX
+     * for parity.
+     */
+    private long resolveCacheCleanupIntervalSeconds() {
+        try {
+            return Math.max(1L, getConfig().getLong("storage.cache.cleanup-interval-seconds", 300L));
+        } catch (Exception e) {
+            return 300L;
+        }
+    }
+
+    /**
+     * Spin up the DataCache offline-player cleanup scheduler. Called after
+     * storage has been initialised so the cleanup pass can call
+     * {@code storageManager.savePlayerData} when flushing dirty entries.
+     */
+    private void startDataCacheCleanup() {
+        if (dataCache == null) {
+            return;
+        }
+        dataCache.startCleanup(this, resolveCacheCleanupIntervalSeconds());
+    }
+
     /**
      * Register all event listeners.
      */
@@ -230,7 +366,7 @@ public class VoidVaultPlugin extends JavaPlugin {
             VoidVaultCommand voidVaultExecutor = new VoidVaultCommand(
                 this, configManager, messageManager, vaultManager, dataCache, storageManager);
             voidVaultCmd.setExecutor(voidVaultExecutor);
-            voidVaultCmd.setTabCompleter(new VoidVaultTabCompleter());
+            voidVaultCmd.setTabCompleter(new VoidVaultTabCompleter(this, configManager, permissionManager));
             getLogger().info("Successfully registered /voidvaults command with aliases: " + voidVaultCmd.getAliases());
         } else {
             getLogger().severe("Failed to register /voidvaults command - command not found in plugin.yml");
@@ -240,7 +376,7 @@ public class VoidVaultPlugin extends JavaPlugin {
         PluginCommand echestCmd = getCommand("echest");
         if (echestCmd != null) {
             EChestCommand echestExecutor = new EChestCommand(
-                this, vaultManager, permissionManager, cooldownManager, economyManager, messageManager);
+                this, vaultManager, permissionManager, cooldownManager, messageManager, configManager);
             echestCmd.setExecutor(echestExecutor);
             getLogger().info("Successfully registered /echest command with aliases: " + echestCmd.getAliases());
             getLogger().info("Remote access commands available: /echest, /pv, /vault");
@@ -278,12 +414,15 @@ public class VoidVaultPlugin extends JavaPlugin {
     }
     
     /**
-     * Initialize bStats metrics.
+     * Initialize bStats metrics. The full MetricsUtil integration lives in
+     * {@link com.voidvault.util.MetricsUtil#register}; we still want a
+     * base {@link Metrics} instance here so the plugin id is registered
+     * even before storage finishes initialising.
      */
     private void initializeMetrics() {
         try {
-            Metrics metrics = new Metrics(this, 28100);
-            getLogger().info("bStats metrics initialized.");
+            new Metrics(this, 28100);
+            getLogger().info("bStats base metrics initialized (custom charts registered after storage init).");
         } catch (Exception e) {
             getLogger().warning("Failed to initialize bStats: " + e.getMessage());
         }
@@ -306,37 +445,139 @@ public class VoidVaultPlugin extends JavaPlugin {
     
     /**
      * Perform a synchronous save of all cached vault data.
-     * This is called during plugin shutdown to prevent data loss.
+     * <p>
+     * We delegate to {@link StorageManager#saveAll()} instead of iterating
+     * {@link DataCache#getCachedPlayers()} and calling
+     * {@link StorageManager#savePlayerData(UUID, com.voidvault.model.PlayerVaultData)}
+     * one-by-one. The reason matters on the REDIS_PERSISTENT backend:
+     * per-player writes only enqueue a MySQL persistence job and do not
+     * wait for it to complete, so calling saveAll() in a loop would
+     * leave a flood of queued jobs at shutdown time — exactly what
+     * blocked the server stop thread before this fix. {@code saveAll()}
+     * is implemented by each backend to flush its own queue atomically
+     * (see {@code RedisBackedMySqlStorage.saveAll()} and
+     * {@code MySqlStorage.saveAll()}).
      */
     private void saveAllDataSync() {
-        // Get all cached players
         var cachedPlayers = dataCache.getCachedPlayers();
-        
+
         if (cachedPlayers.isEmpty()) {
             getLogger().info("No cached data to save.");
             return;
         }
-        
-        getLogger().info("Saving data for " + cachedPlayers.size() + " players...");
-        
-        // Create a list of save futures
-        var saveFutures = cachedPlayers.stream()
-            .map(playerId -> {
-                return dataCache.get(playerId)
-                    .map(data -> storageManager.savePlayerData(playerId, data)
-                        .exceptionally(ex -> {
-                            getLogger().severe("Failed to save data for player " + playerId + ": " + ex.getMessage());
-                            return null;
-                        }))
-                    .orElse(CompletableFuture.completedFuture(null));
-            })
-            .toArray(CompletableFuture[]::new);
-        
-        // Wait for all saves to complete
+
+        int totalDirty = dataCache.dirtyCount();
+        getLogger().info("Saving data for " + cachedPlayers.size() + " players ("
+                + totalDirty + " dirty)...");
+
+        long timeoutSeconds = resolveShutdownSaveTimeoutSeconds();
+        long deadline = System.currentTimeMillis() + timeoutSeconds * 1000L;
+        AtomicLong lastProgressLog = new AtomicLong(System.currentTimeMillis());
+        ScheduledExecutorService monitor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "voidvault-shutdown-monitor");
+            t.setDaemon(true);
+            return t;
+        });
+        ScheduledFuture<?> monitorTask = monitor.scheduleAtFixedRate(() -> {
+            long remainingDirty = dataCache.dirtyCount();
+            long elapsedMs = System.currentTimeMillis() - (deadline - timeoutSeconds * 1000L);
+            getLogger().info("[Shutdown] progress: dirty=" + remainingDirty
+                    + " (was " + totalDirty + "), elapsed=" + elapsedMs + "ms");
+            lastProgressLog.set(System.currentTimeMillis());
+        }, 1, 1, TimeUnit.SECONDS);
+
         try {
-            CompletableFuture.allOf(saveFutures).join();
+            // Each backend implements saveAll() with its own internal
+            // drain semantics. Bounding the wait here keeps the
+            // server stop thread from hanging on a wedged MySQL — if
+            // saveAll() exceeds the budget we still call close() next
+            // and the remaining in-flight writes get a final attempt
+            // there.
+            storageManager.saveAll()
+                    .get(timeoutSeconds, TimeUnit.SECONDS);
+            getLogger().info("saveAll() finished within " + timeoutSeconds + "s budget");
+        } catch (java.util.concurrent.TimeoutException te) {
+            int remainingDirty = dataCache.dirtyCount();
+            getLogger().warning("saveAll() exceeded " + timeoutSeconds
+                    + "s budget during shutdown; " + remainingDirty
+                    + " dirty player(s) not flushed. Remaining dirty UUIDs: "
+                    + formatDirtyUUIDs(dataCache.getDirtyPlayers()));
+            dumpPoolStateOnTimeout();
         } catch (Exception e) {
             getLogger().log(Level.SEVERE, "Error during synchronous save", e);
+        } finally {
+            monitorTask.cancel(false);
+            monitor.shutdown();
+            try {
+                if (!monitor.awaitTermination(1, TimeUnit.SECONDS)) {
+                    monitor.shutdownNow();
+                }
+            } catch (InterruptedException ie) {
+                monitor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * Read the configured shutdown save-timeout. Falls back to 30 seconds
+     * if the YAML file is missing the key (the legacy default was 8s, which
+     * is too aggressive for a 200-player server).
+     */
+    private long resolveShutdownSaveTimeoutSeconds() {
+        try {
+            return Math.max(1L, getConfig().getLong("shutdown.save-timeout-seconds", 30L));
+        } catch (Exception e) {
+            return 30L;
+        }
+    }
+
+    /**
+     * Pretty-print the dirty player set so operators can correlate the
+     * warning with the player list.
+     */
+    private String formatDirtyUUIDs(java.util.Set<UUID> dirty) {
+        if (dirty.isEmpty()) {
+            return "[]";
+        }
+        StringBuilder sb = new StringBuilder(dirty.size() * 40);
+        sb.append('[');
+        int i = 0;
+        for (UUID id : dirty) {
+            if (i++ > 0) {
+                sb.append(", ");
+            }
+            sb.append(id);
+            if (i >= 20) {
+                sb.append(", ... (+").append(dirty.size() - 20).append(" more)");
+                break;
+            }
+        }
+        sb.append(']');
+        return sb.toString();
+    }
+
+    /**
+     * Log Hikari + Jedis pool counters at shutdown timeout. Helps the
+     * operator figure out whether the hang is on the MySQL or Redis side.
+     */
+    private void dumpPoolStateOnTimeout() {
+        try {
+            var hikari = storageManager.getHikariPoolMetrics();
+            if (hikari != null) {
+                getLogger().warning("[Shutdown] Hikari pool at timeout: active="
+                        + hikari.getActiveConnections() + ", idle="
+                        + hikari.getIdleConnections() + ", waiting="
+                        + hikari.getThreadsAwaitingConnection());
+            }
+            var jedis = storageManager.getJedisPoolMetrics();
+            if (jedis != null) {
+                getLogger().warning("[Shutdown] Jedis pool at timeout: active="
+                        + jedis.getNumActive() + ", idle=" + jedis.getNumIdle()
+                        + ", waiting=" + jedis.getNumWaiters());
+            }
+        } catch (Exception e) {
+            getLogger().log(Level.WARNING, "Failed to dump pool state on shutdown", e);
         }
     }
     

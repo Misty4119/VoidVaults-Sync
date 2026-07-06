@@ -89,29 +89,38 @@ public class PermissionManager {
      */
     public int getMaxPages(Player player) {
         PluginMode mode = configManager.getPluginMode();
-        
+
         // SIMPLE mode only has 1 page
         if (mode == PluginMode.SIMPLE) {
             return 1;
         }
-        
+
+        // Absolute upper bound configured in config.yml (defaults to 10).
+        // Custom grants, permission tiers, and default-pages are all
+        // clamped to this cap so admins can raise or lower it freely.
+        int globalMax = configManager.getMaxPages();
+        if (globalMax < 1) {
+            globalMax = 1;
+        }
+
         // Check PlayerVaultData.customPages() first
         PlayerVaultData data = dataCache.get(player.getUniqueId()).orElse(null);
         if (data != null && data.hasCustomPages()) {
-            // Return custom value if > 0, but cap at 5
-            return Math.min(data.customPages(), 5);
+            // Return custom value if > 0, but cap at the configured global max
+            return Math.min(data.customPages(), globalMax);
         }
-        
-        // Otherwise fall through to permission/config checks
-        // PAGED mode: check page permissions (max 5)
-        for (int page = 5; page >= 1; page--) {
+
+        // Otherwise fall through to permission/config checks.
+        // PAGED mode: scan the configured tier list (1..globalMax) for the
+        // highest tier the player actually owns.
+        for (int page = globalMax; page >= 1; page--) {
             if (player.hasPermission(PERM_PAGE_PREFIX + page)) {
                 return page;
             }
         }
-        
-        // No page permissions found, use configured default (capped at 5)
-        return Math.min(configManager.getDefaultPages(), 5);
+
+        // No page permissions found, use configured default (capped at globalMax)
+        return Math.min(configManager.getDefaultPages(), globalMax);
     }
     
     /**

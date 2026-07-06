@@ -73,7 +73,7 @@ public class EnderChestListener implements Listener {
         vaultManager.openVault(player, 1).exceptionally(ex -> {
             // Handle data loading errors
             logger.severe("Failed to open vault for " + player.getName() + ": " + ex.getMessage());
-            ex.printStackTrace();
+            logger.log(java.util.logging.Level.SEVERE, "Exception details:", ex);
             messageManager.send(player, "error.load-failed");
             return null;
         });

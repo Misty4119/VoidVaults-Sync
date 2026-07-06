@@ -16,13 +16,13 @@ import org.bukkit.inventory.Inventory;
  */
 public abstract class VaultGUI {
     protected final Player player;
-    protected final int page;
+    protected int page;
     protected final Inventory inventory;
     protected final ConfigManager configManager;
     protected final PermissionManager permissionManager;
     protected final DataCache dataCache;
     protected final PlayerVaultData vaultData;
-    
+
     /**
      * Constructor for VaultGUI base class.
      *

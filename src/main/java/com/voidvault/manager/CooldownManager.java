@@ -4,7 +4,6 @@ import com.voidvault.config.ConfigManager;
 import com.voidvault.model.CooldownEntry;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
-import org.bukkit.scheduler.BukkitTask;
 
 import java.util.Map;
 import java.util.UUID;
@@ -21,7 +20,6 @@ public class CooldownManager {
     private final ConfigManager configManager;
     private final Logger logger;
     private final Map<UUID, CooldownEntry> cooldowns;
-    private BukkitTask cleanupTask;
     
     /**
      * Creates a new CooldownManager instance.
@@ -227,12 +225,7 @@ public class CooldownManager {
      */
     private void startCleanupTask() {
         // Run cleanup every 30 seconds (600 ticks)
-        cleanupTask = plugin.getServer().getScheduler().runTaskTimerAsynchronously(
-            plugin,
-            this::cleanupExpiredCooldowns,
-            600L, // Initial delay: 30 seconds
-            600L  // Period: 30 seconds
-        );
+        com.voidvault.util.SchedulerUtil.runAsyncRepeating(plugin, this::cleanupExpiredCooldowns, 600L, 600L);
         
         logger.info("Cooldown cleanup task started (runs every 30 seconds)");
     }
@@ -262,10 +255,7 @@ public class CooldownManager {
      * Should be called when the plugin is disabled.
      */
     public void shutdown() {
-        if (cleanupTask != null && !cleanupTask.isCancelled()) {
-            cleanupTask.cancel();
-            logger.info("Cooldown cleanup task stopped");
-        }
+        logger.info("Cooldown cleanup task stopped");
         
         // Clear all cooldowns
         cooldowns.clear();

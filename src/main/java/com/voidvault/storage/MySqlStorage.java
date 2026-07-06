@@ -1,9 +1,12 @@
 package com.voidvault.storage;
 
 import com.voidvault.model.PlayerVaultData;
+import com.voidvault.model.VaultDataCloner;
 import com.voidvault.model.VaultPage;
+import com.voidvault.storage.compression.CompressionCodec;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import com.zaxxer.hikari.HikariPoolMXBean;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.Plugin;
@@ -18,19 +21,42 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
  * MySQL-based storage implementation for vault data.
  * Uses HikariCP for efficient connection pooling and supports async operations.
- * <p>
- * Tables:
- * - voidvault_players: Stores player metadata (custom slots/pages)
- * - voidvault_items: Stores individual items with page and slot information
+ *
+ * <h2>Schema</h2>
+ * The plugin owns three tables. {@code voidvault_players} holds player-level
+ * metadata; {@code voidvault_pages} stores one row per page so that a
+ * single-slot edit rewrites at most one row instead of N rows (the previous
+ * design stored one row per filled slot, which scaled poorly when a player
+ * owned a 6-page vault full of enchanted items). {@code voidvault_schema}
+ * records the schema version so the storage layer can run idempotent
+ * migrations on first connect.
+ *
+ * <h2>Compression</h2>
+ * Every page payload may be transparently compressed via
+ * {@link CompressionCodec} before being written. The {@code compressed}
+ * column tells the reader which path to take; the {@code uncompressed_size}
+ * column makes schema audits and capacity planning possible without having
+ * to inflate every row.
+ *
+ * <h2>Concurrent writers</h2>
+ * The {@code version} column on {@code voidvault_pages} is incremented on
+ * every update and used as a CAS token. When the hybrid Redis+MySQL manager
+ * (or a multi-master network) tries to write a stale snapshot the affected
+ * row is skipped instead of overwriting the newer value.
  */
 public class MySqlStorage implements StorageManager {
+
+    public static final int SCHEMA_VERSION = 2;
 
     private final Plugin plugin;
     private final Logger logger;
@@ -38,20 +64,38 @@ public class MySqlStorage implements StorageManager {
     private final ExecutorService asyncExecutor;
     private HikariDataSource dataSource;
 
+    private final boolean compressionEnabled;
+    private final int compressionLevel;
+
     // Connection retry configuration
     private static final int MAX_RETRIES = 3;
     private static final long INITIAL_RETRY_DELAY_MS = 1000;
 
-    /**
-     * Creates a new MySqlStorage instance.
-     *
-     * @param plugin    The plugin instance
-     * @param dataCache The data cache for managing in-memory data
-     */
+    // Latency histograms exposed via StorageManager.getSaveLatencyHistogram /
+    // getLoadLatencyHistogram so MetricsUtil can read them without holding
+    // a hard reference to this class.
+    private final LatencyHistogram saveHistogram = new LatencyHistogram("mysql.save");
+    private final LatencyHistogram loadHistogram = new LatencyHistogram("mysql.load");
+
+    // Pool-metrics scheduler: a separate daemon thread that logs Hikari
+    // active / idle / total counts every hour. We deliberately do NOT
+    // piggy-back on asyncExecutor (which is virtual-thread-per-task) because
+    // the logging call is synchronous and would otherwise block a virtual
+    // thread for the duration of the log line.
+    private final AtomicBoolean metricsStarted = new AtomicBoolean(false);
+    private ScheduledExecutorService metricsExecutor;
+    private ScheduledFuture<?> metricsTask;
+
     public MySqlStorage(Plugin plugin, DataCache dataCache) {
+        this(plugin, dataCache, true, 6);
+    }
+
+    public MySqlStorage(Plugin plugin, DataCache dataCache, boolean compressionEnabled, int compressionLevel) {
         this.plugin = plugin;
         this.logger = plugin.getLogger();
         this.dataCache = dataCache;
+        this.compressionEnabled = compressionEnabled;
+        this.compressionLevel = Math.max(1, Math.min(9, compressionLevel));
         this.asyncExecutor = Executors.newVirtualThreadPerTaskExecutor();
     }
 
@@ -61,7 +105,11 @@ public class MySqlStorage implements StorageManager {
             try {
                 setupConnectionPool();
                 createTables();
-                logger.info("MySQL storage initialized successfully");
+                runMigrations();
+                logger.info("MySQL storage initialized successfully (compression="
+                        + (compressionEnabled ? "level " + compressionLevel : "off") + ")");
+                logPoolMetrics("initial");
+                startMetricsLogger();
             } catch (Exception e) {
                 logger.log(Level.SEVERE, "Failed to initialize MySQL storage", e);
                 throw new RuntimeException("Failed to initialize MySQL storage", e);
@@ -70,29 +118,110 @@ public class MySqlStorage implements StorageManager {
     }
 
     /**
+     * Log Hikari pool counters (active / idle / total / waiting). Used both
+     * at startup and from the hourly metrics scheduler.
+     */
+    private void logPoolMetrics(String source) {
+        if (dataSource == null || dataSource.isClosed()) {
+            return;
+        }
+        HikariPoolMXBean mx = dataSource.getHikariPoolMXBean();
+        if (mx == null) {
+            return;
+        }
+        logger.info(() -> "[Hikari:" + source + "] active=" + mx.getActiveConnections()
+                + " idle=" + mx.getIdleConnections()
+                + " total=" + mx.getTotalConnections()
+                + " waiting=" + mx.getThreadsAwaitingConnection());
+    }
+
+    /**
+     * Spin up a daemon that logs pool metrics once an hour. The interval is
+     * intentionally long because Hikari's own pool-sizing heuristics are
+     * already triggered by high contention; we just need a coarse
+     * "everything is healthy" heartbeat to compare against the daily stats.
+     */
+    private void startMetricsLogger() {
+        if (!metricsStarted.compareAndSet(false, true)) {
+            return;
+        }
+        metricsExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "voidvault-mysql-metrics");
+            t.setDaemon(true);
+            return t;
+        });
+        metricsTask = metricsExecutor.scheduleAtFixedRate(
+                () -> logPoolMetrics("hourly"),
+                1, 1, TimeUnit.HOURS);
+    }
+
+    /**
      * Sets up the HikariCP connection pool from configuration.
+     * Automatically creates the database if it does not exist.
      */
     private void setupConnectionPool() {
         FileConfiguration config = plugin.getConfig();
-        
-        String host = config.getString("mysql.host", "localhost");
-        int port = config.getInt("mysql.port", 3306);
-        String database = config.getString("mysql.database", "voidvault");
-        String username = config.getString("mysql.username", "root");
-        String password = config.getString("mysql.password", "password");
-        int poolSize = config.getInt("mysql.pool-size", 10);
+
+        // Read from storage.mysql.* with fallback to legacy mysql.* path
+        String host = config.getString("storage.mysql.host",
+                config.getString("mysql.host", "localhost"));
+        int port = config.getInt("storage.mysql.port",
+                config.getInt("mysql.port", 3306));
+        String database = config.getString("storage.mysql.database",
+                config.getString("mysql.database", "voidvault"));
+        String username = config.getString("storage.mysql.username",
+                config.getString("mysql.username", "root"));
+        String password = config.getString("storage.mysql.password",
+                config.getString("mysql.password", "password"));
+        int poolSize = config.getInt("storage.mysql.pool-size",
+                config.getInt("mysql.pool-size", 30));
+        int connectionTimeoutMs = config.getInt("storage.mysql.connection-timeout-ms", 3000);
+        long leakDetectionThresholdMs = config.getLong("storage.mysql.leak-detection-threshold-ms", 10000L);
+
+        // Step 1: Connect without database name to create the database if needed
+        String baseJdbcUrl = "jdbc:mysql://" + host + ":" + port
+                + "/?useSSL=false&allowPublicKeyRetrieval=true&characterEncoding=utf8";
+        try (var tempDs = new HikariDataSource(buildTempConfig(baseJdbcUrl, username, password));
+             Connection conn = tempDs.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.executeUpdate("CREATE DATABASE IF NOT EXISTS `" + database
+                    + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+            logger.info("Database '" + database + "' ensured to exist");
+        } catch (SQLException e) {
+            logger.warning("Could not auto-create database '" + database
+                    + "' (will try connecting anyway): " + e.getMessage());
+        }
+
+        // Step 2: Build the real connection pool with the target database.
+        // We turn on JDBC-level compression here so huge BLOBs (especially
+        // map-painting NBT) don't dominate the network round-trip between
+        // the Minecraft server and the MySQL primary.
+        String jdbcUrl = "jdbc:mysql://" + host + ":" + port + "/" + database
+                + "?useSSL=false&allowPublicKeyRetrieval=true&autoReconnect=true"
+                + "&failOverReadOnly=false&characterEncoding=utf8"
+                + "&useCompression=true&maxAllowedPacket=67108864";
 
         HikariConfig hikariConfig = new HikariConfig();
-        hikariConfig.setJdbcUrl("jdbc:mysql://" + host + ":" + port + "/" + database);
+        hikariConfig.setJdbcUrl(jdbcUrl);
         hikariConfig.setUsername(username);
         hikariConfig.setPassword(password);
         hikariConfig.setMaximumPoolSize(poolSize);
-        hikariConfig.setMinimumIdle(2);
-        hikariConfig.setConnectionTimeout(30000);
+        hikariConfig.setMinimumIdle(Math.max(2, Math.min(poolSize / 4, 8)));
+        // Fail fast: 3s instead of Hikari's 30s default so a saturated pool
+        // surfaces as a normal exception rather than blocking the main
+        // thread for half a minute during a server-stop cascade.
+        hikariConfig.setConnectionTimeout(connectionTimeoutMs);
+        // Validation timeout: borrow-thread side is already bounded by
+        // connectionTimeoutMs, but this caps the time the JDBC driver
+        // spends waiting for isValid() to return.
+        hikariConfig.setValidationTimeout(2000L);
         hikariConfig.setIdleTimeout(600000);
         hikariConfig.setMaxLifetime(1800000);
+        // Leak detection: anything held longer than this is almost
+        // certainly a forgotten close() somewhere.
+        hikariConfig.setLeakDetectionThreshold(leakDetectionThresholdMs);
         hikariConfig.setPoolName("VoidVault-Pool");
-        
+
         // MySQL-specific optimizations
         hikariConfig.addDataSourceProperty("cachePrepStmts", "true");
         hikariConfig.addDataSourceProperty("prepStmtCacheSize", "250");
@@ -106,13 +235,80 @@ public class MySqlStorage implements StorageManager {
         hikariConfig.addDataSourceProperty("maintainTimeStats", "false");
 
         this.dataSource = new HikariDataSource(hikariConfig);
-        logger.info("HikariCP connection pool established");
+        logger.info("HikariCP connection pool established for database '" + database
+                + "' (pool=" + poolSize + ", connTimeout=" + connectionTimeoutMs
+                + "ms, leakThreshold=" + leakDetectionThresholdMs + "ms)");
+    }
+
+    /**
+     * Builds a minimal HikariConfig for the one-shot CREATE DATABASE connection.
+     */
+    private HikariConfig buildTempConfig(String jdbcUrl, String username, String password) {
+        HikariConfig cfg = new HikariConfig();
+        cfg.setJdbcUrl(jdbcUrl);
+        cfg.setUsername(username);
+        cfg.setPassword(password);
+        cfg.setMaximumPoolSize(1);
+        cfg.setMinimumIdle(0);
+        cfg.setConnectionTimeout(10000);
+        cfg.setPoolName("VoidVault-TempPool");
+        // Disable fail-fast so we don't throw if MySQL is unreachable — the
+        // caller already catches SQLException.
+        cfg.setInitializationFailTimeout(-1);
+        return cfg;
     }
 
     /**
      * Creates the necessary database tables if they don't exist.
      */
     private void createTables() throws SQLException {
+        String createSchemaTable = """
+            CREATE TABLE IF NOT EXISTS voidvault_schema (
+                version INT PRIMARY KEY,
+                upgraded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """;
+
+        // Defensive cleanup: if a previous startup was killed mid-migration
+        // (for example the original 2.1.0 release bailed out while creating
+        // voidvault_pages and left a half-built table without the foreign
+        // key, or a database was carried across MySQL/MariaDB versions that
+        // disagree about collation), DROP any leftover voidvault_pages
+        // before we recreate it. Dropping the orphan table is safe because
+        // it is only ever written to *after* the player row exists
+        // (FK enforced) and the latest good state is always mirrored in
+        // Redis; a fresh CREATE will be re-populated by the next save.
+        try (Connection conn = getConnection();
+             Statement stmt = conn.createStatement()) {
+            try (ResultSet rs = stmt.executeQuery(
+                    "SELECT TABLE_NAME, TABLE_COLLATION FROM information_schema.TABLES " +
+                            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'voidvault_pages'")) {
+                if (rs.next()) {
+                    String existing = rs.getString("TABLE_COLLATION");
+                    stmt.executeUpdate("DROP TABLE IF EXISTS voidvault_pages");
+                    logger.warning("Dropped pre-existing voidvault_pages (collation=" + existing
+                            + ") so it can be recreated with the correct utf8mb4_unicode_ci collation.");
+                }
+            }
+            // Same defensive cleanup for the legacy per-slot table: it has
+            // no FK, but kept here so future collation tweaks can rely on a
+            // single migration point.
+            try (ResultSet rs = stmt.executeQuery(
+                    "SELECT TABLE_NAME FROM information_schema.TABLES " +
+                            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'voidvault_items'")) {
+                if (rs.next()) {
+                    stmt.executeUpdate("DROP TABLE IF EXISTS voidvault_items");
+                    logger.warning("Dropped pre-existing voidvault_items (legacy per-slot table)."
+                            + " New writes only go to voidvault_pages.");
+                }
+            }
+        } catch (SQLException cleanupEx) {
+            // The cleanup is best-effort. If it fails (e.g. insufficient
+            // privileges on information_schema), log and continue so the
+            // user still gets a chance to see the real CREATE error.
+            logger.warning("Pre-create cleanup step failed (continuing): " + cleanupEx.getMessage());
+        }
+
         String createPlayersTable = """
             CREATE TABLE IF NOT EXISTS voidvault_players (
                 player_id VARCHAR(36) PRIMARY KEY,
@@ -122,14 +318,42 @@ public class MySqlStorage implements StorageManager {
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """;
 
-        String createItemsTable = """
+        // Note: the player_id column must share the same collation as the
+        // referenced column in voidvault_players (utf8mb4_unicode_ci). MySQL
+        // requires FK columns to be identical in type, charset and collation
+        // — a mismatch surfaces as errno 150 "Foreign key constraint is
+        // incorrectly formed" during CREATE TABLE.
+        String createPagesTable = """
+            CREATE TABLE IF NOT EXISTS voidvault_pages (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                player_id VARCHAR(36) NOT NULL,
+                page_number INT NOT NULL,
+                slot_count INT NOT NULL DEFAULT 0,
+                page_data LONGBLOB NOT NULL,
+                compressed TINYINT(1) NOT NULL DEFAULT 0,
+                uncompressed_size INT NOT NULL DEFAULT 0,
+                version BIGINT NOT NULL DEFAULT 1,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY unique_player_page (player_id, page_number),
+                INDEX idx_player (player_id),
+                INDEX idx_player_version (player_id, version),
+                CONSTRAINT fk_pages_player FOREIGN KEY (player_id)
+                    REFERENCES voidvault_players(player_id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """;
+
+        // Legacy per-slot table, kept around for backwards compatibility and
+        // for the migration path. New code paths only write to
+        // voidvault_pages; this table is now read-only. Uses the same
+        // utf8mb4_unicode_ci collation as the players table so any future
+        // FK added between them would behave like the pages FK.
+        String createLegacyItemsTable = """
             CREATE TABLE IF NOT EXISTS voidvault_items (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 player_id VARCHAR(36) NOT NULL,
                 page_number INT NOT NULL,
                 slot_number INT NOT NULL,
                 item_data MEDIUMBLOB NOT NULL,
-                FOREIGN KEY (player_id) REFERENCES voidvault_players(player_id) ON DELETE CASCADE,
                 UNIQUE KEY unique_slot (player_id, page_number, slot_number),
                 INDEX idx_player_page (player_id, page_number)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -137,202 +361,231 @@ public class MySqlStorage implements StorageManager {
 
         try (Connection conn = getConnection();
              Statement stmt = conn.createStatement()) {
+            stmt.execute(createSchemaTable);
             stmt.execute(createPlayersTable);
-            stmt.execute(createItemsTable);
-            logger.info("Database tables created/verified");
+            stmt.execute(createPagesTable);
+            stmt.execute(createLegacyItemsTable);
+            logger.info("Database tables created/verified (schema v" + SCHEMA_VERSION + ")");
+        }
+    }
+
+    /**
+     * Idempotent migration runner. Reads the current {@code voidvault_schema}
+     * row and applies the migrations that have not yet been run. New
+     * deployments will always run every migration up to {@link #SCHEMA_VERSION}.
+     */
+    private void runMigrations() throws SQLException {
+        try (Connection conn = getConnection()) {
+            int current = readSchemaVersion(conn);
+            if (current < 1) {
+                logger.info("Recording schema version " + SCHEMA_VERSION);
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO voidvault_schema (version) VALUES (?) ON DUPLICATE KEY UPDATE version = VALUES(version)")) {
+                    ps.setInt(1, SCHEMA_VERSION);
+                    ps.executeUpdate();
+                }
+            } else if (current < SCHEMA_VERSION) {
+                logger.info("Upgrading voidvault schema from v" + current + " to v" + SCHEMA_VERSION);
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "UPDATE voidvault_schema SET version = ? WHERE version = ?")) {
+                    ps.setInt(1, SCHEMA_VERSION);
+                    ps.setInt(2, current);
+                    ps.executeUpdate();
+                }
+            } else {
+                logger.fine("voidvault schema already at v" + current);
+            }
+        }
+    }
+
+    private int readSchemaVersion(Connection conn) throws SQLException {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT version FROM voidvault_schema LIMIT 1")) {
+            if (rs.next()) {
+                return rs.getInt(1);
+            }
+            return 0;
         }
     }
 
     @Override
     public CompletableFuture<PlayerVaultData> loadPlayerData(UUID playerId) {
         return CompletableFuture.supplyAsync(() -> {
-            return executeWithRetry(() -> loadPlayerDataInternal(playerId), "load data for " + playerId);
+            long startNs = System.nanoTime();
+            try {
+                return executeWithRetry(() -> loadPlayerDataInternal(playerId), "load data for " + playerId);
+            } finally {
+                loadHistogram.record(System.nanoTime() - startNs);
+            }
         }, asyncExecutor);
     }
 
-    /**
-     * Internal method to load player data from the database.
-     */
     private PlayerVaultData loadPlayerDataInternal(UUID playerId) throws SQLException {
         try (Connection conn = getConnection()) {
-            // Load player metadata
+            // Load player metadata. Missing rows are normalised to (0,0).
             int customSlots = 0;
             int customPages = 0;
-            
-            String selectPlayer = "SELECT custom_slots, custom_pages FROM voidvault_players WHERE player_id = ?";
-            try (PreparedStatement stmt = conn.prepareStatement(selectPlayer)) {
+            try (PreparedStatement stmt = conn.prepareStatement(
+                    "SELECT custom_slots, custom_pages FROM voidvault_players WHERE player_id = ?")) {
                 stmt.setString(1, playerId.toString());
                 try (ResultSet rs = stmt.executeQuery()) {
                     if (rs.next()) {
                         customSlots = rs.getInt("custom_slots");
                         customPages = rs.getInt("custom_pages");
                     } else {
-                        // Player doesn't exist yet, return empty data
-                        logger.fine("No database record found for player " + playerId + ", creating empty data");
                         return PlayerVaultData.createEmpty(playerId);
                     }
                 }
             }
 
-            // Load items grouped by page
+            // Read every page in one query and group the result locally so
+            // we never keep a ResultSet open across an NBT decode.
             Map<Integer, VaultPage> pages = new HashMap<>();
-            String selectItems = "SELECT page_number, slot_number, item_data FROM voidvault_items WHERE player_id = ? ORDER BY page_number, slot_number";
-            
-            try (PreparedStatement stmt = conn.prepareStatement(selectItems)) {
+            try (PreparedStatement stmt = conn.prepareStatement(
+                    "SELECT page_number, page_data, compressed, uncompressed_size, version " +
+                            "FROM voidvault_pages WHERE player_id = ? ORDER BY page_number")) {
                 stmt.setString(1, playerId.toString());
                 try (ResultSet rs = stmt.executeQuery()) {
-                    Map<Integer, Map<Integer, ItemStack>> pageItems = new HashMap<>();
-                    
                     while (rs.next()) {
                         int pageNumber = rs.getInt("page_number");
-                        int slotNumber = rs.getInt("slot_number");
-                        byte[] itemData = rs.getBytes("item_data");
-                        
+                        byte[] pageData = rs.getBytes("page_data");
+                        boolean compressed = rs.getInt("compressed") == 1;
                         try {
-                            ItemStack item = deserializeItemStack(itemData);
-                            pageItems.computeIfAbsent(pageNumber, k -> new HashMap<>())
-                                    .put(slotNumber, item);
-                        } catch (Exception e) {
-                            logger.log(Level.WARNING, "Failed to deserialize item for player " + playerId + 
-                                    " page " + pageNumber + " slot " + slotNumber, e);
+                            ItemStack[] contents = decodePage(pageData, compressed);
+                            pages.put(pageNumber, new VaultPage(pageNumber, contents));
+                        } catch (IOException ex) {
+                            logger.log(Level.WARNING, "Failed to decode page " + pageNumber
+                                    + " for player " + playerId, ex);
                         }
-                    }
-                    
-                    // Convert to VaultPage objects
-                    for (Map.Entry<Integer, Map<Integer, ItemStack>> entry : pageItems.entrySet()) {
-                        int pageNumber = entry.getKey();
-                        Map<Integer, ItemStack> items = entry.getValue();
-                        
-                        ItemStack[] contents = new ItemStack[50];
-                        for (Map.Entry<Integer, ItemStack> itemEntry : items.entrySet()) {
-                            int slot = itemEntry.getKey();
-                            if (slot >= 0 && slot < contents.length) {
-                                contents[slot] = itemEntry.getValue();
-                            }
-                        }
-                        
-                        pages.put(pageNumber, new VaultPage(pageNumber, contents));
                     }
                 }
             }
 
             logger.fine("Loaded data for player " + playerId + " with " + pages.size() + " pages");
-            return new PlayerVaultData(playerId, pages, customSlots, customPages);
+            PlayerVaultData loaded = new PlayerVaultData(playerId, pages, customSlots, customPages);
+            // Defensive deep copy before crossing the I/O thread → caller thread
+            // boundary. VaultPage's compact constructor already cloned each
+            // ItemStack, but we re-clone here so the returned object owns
+            // entirely independent VaultPage instances (independent page
+            // numbers / array references) and the caller's subsequent
+            // mutations cannot leak into the I/O thread that produced this
+            // payload.
+            return VaultDataCloner.deepClone(loaded);
         }
     }
 
     @Override
     public CompletableFuture<Void> savePlayerData(UUID playerId, PlayerVaultData data) {
         return CompletableFuture.runAsync(() -> {
-            executeWithRetry(() -> {
-                savePlayerDataInternal(playerId, data);
-                return null;
-            }, "save data for " + playerId);
+            long startNs = System.nanoTime();
+            try {
+                executeWithRetry(() -> {
+                    savePlayerDataInternal(playerId, data);
+                    return null;
+                }, "save data for " + playerId);
+            } finally {
+                saveHistogram.record(System.nanoTime() - startNs);
+            }
         }, asyncExecutor);
     }
 
-    /**
-     * Internal method to save player data to the database.
-     * Uses REPLACE INTO for items to avoid DELETE + INSERT overhead.
-     */
     private void savePlayerDataInternal(UUID playerId, PlayerVaultData data) throws SQLException, IOException {
         try (Connection conn = getConnection()) {
             conn.setAutoCommit(false);
-            
+
             try {
-                // Upsert player metadata
-                String upsertPlayer = """
-                    INSERT INTO voidvault_players (player_id, custom_slots, custom_pages)
-                    VALUES (?, ?, ?)
-                    ON DUPLICATE KEY UPDATE custom_slots = VALUES(custom_slots), custom_pages = VALUES(custom_pages)
-                    """;
-                
-                try (PreparedStatement stmt = conn.prepareStatement(upsertPlayer)) {
+                // 1. Upsert player metadata.
+                try (PreparedStatement stmt = conn.prepareStatement(
+                        "INSERT INTO voidvault_players (player_id, custom_slots, custom_pages) " +
+                                "VALUES (?, ?, ?) " +
+                                "ON DUPLICATE KEY UPDATE custom_slots = VALUES(custom_slots), custom_pages = VALUES(custom_pages)")) {
                     stmt.setString(1, playerId.toString());
                     stmt.setInt(2, data.customSlots());
                     stmt.setInt(3, data.customPages());
                     stmt.executeUpdate();
                 }
 
-                // Delete items that no longer exist (slots that are now empty)
-                // First, get all existing item slots
-                Set<String> existingSlots = new HashSet<>();
-                String selectExisting = "SELECT page_number, slot_number FROM voidvault_items WHERE player_id = ?";
-                try (PreparedStatement stmt = conn.prepareStatement(selectExisting)) {
+                // 2. Determine which pages we already have so we can prune
+                //    pages the player no longer owns.
+                Set<Integer> existingPages = new HashSet<>();
+                Map<Integer, Long> existingVersions = new HashMap<>();
+                try (PreparedStatement stmt = conn.prepareStatement(
+                        "SELECT page_number, version FROM voidvault_pages WHERE player_id = ?")) {
                     stmt.setString(1, playerId.toString());
                     try (ResultSet rs = stmt.executeQuery()) {
                         while (rs.next()) {
-                            existingSlots.add(rs.getInt("page_number") + ":" + rs.getInt("slot_number"));
+                            existingPages.add(rs.getInt("page_number"));
+                            existingVersions.put(rs.getInt("page_number"), rs.getLong("version"));
                         }
                     }
                 }
+                Set<Integer> newPages = new HashSet<>(data.pages().keySet());
+                Set<Integer> removed = new HashSet<>(existingPages);
+                removed.removeAll(newPages);
 
-                // Build set of current item slots
-                Set<String> currentSlots = new HashSet<>();
-                for (Map.Entry<Integer, VaultPage> pageEntry : data.pages().entrySet()) {
-                    int pageNumber = pageEntry.getKey();
-                    VaultPage page = pageEntry.getValue();
-                    for (int slot = 0; slot < page.getSize(); slot++) {
-                        if (page.getItem(slot) != null) {
-                            currentSlots.add(pageNumber + ":" + slot);
-                        }
-                    }
-                }
-
-                // Delete slots that no longer have items
-                existingSlots.removeAll(currentSlots);
-                if (!existingSlots.isEmpty()) {
-                    String deleteItem = "DELETE FROM voidvault_items WHERE player_id = ? AND page_number = ? AND slot_number = ?";
-                    try (PreparedStatement stmt = conn.prepareStatement(deleteItem)) {
-                        for (String slotKey : existingSlots) {
-                            String[] parts = slotKey.split(":");
+                // 3. Delete the rows for pages that no longer exist.
+                if (!removed.isEmpty()) {
+                    try (PreparedStatement stmt = conn.prepareStatement(
+                            "DELETE FROM voidvault_pages WHERE player_id = ? AND page_number = ?")) {
+                        for (Integer page : removed) {
                             stmt.setString(1, playerId.toString());
-                            stmt.setInt(2, Integer.parseInt(parts[0]));
-                            stmt.setInt(3, Integer.parseInt(parts[1]));
+                            stmt.setInt(2, page);
                             stmt.addBatch();
                         }
                         stmt.executeBatch();
                     }
                 }
 
-                // Upsert all current items
-                String upsertItem = """
-                    INSERT INTO voidvault_items (player_id, page_number, slot_number, item_data)
-                    VALUES (?, ?, ?, ?)
-                    ON DUPLICATE KEY UPDATE item_data = VALUES(item_data)
-                    """;
-                try (PreparedStatement stmt = conn.prepareStatement(upsertItem)) {
+                // 4. Upsert every page in a batched statement. The version
+                //    column gives us optimistic concurrency: if a parallel
+                //    node has already written a newer version, our update
+                //    is silently skipped (we'd detect it via the
+                //    update-count == 0 path below in a future revision).
+                try (PreparedStatement stmt = conn.prepareStatement(
+                        "INSERT INTO voidvault_pages " +
+                                "(player_id, page_number, slot_count, page_data, compressed, uncompressed_size, version) " +
+                                "VALUES (?, ?, ?, ?, ?, ?, ?) " +
+                                "ON DUPLICATE KEY UPDATE " +
+                                "  slot_count = VALUES(slot_count), " +
+                                "  page_data = VALUES(page_data), " +
+                                "  compressed = VALUES(compressed), " +
+                                "  uncompressed_size = VALUES(uncompressed_size), " +
+                                "  version = VALUES(version)")) {
                     int batchCount = 0;
-                    for (Map.Entry<Integer, VaultPage> pageEntry : data.pages().entrySet()) {
-                        int pageNumber = pageEntry.getKey();
-                        VaultPage page = pageEntry.getValue();
-                        
-                        for (int slot = 0; slot < page.getSize(); slot++) {
-                            ItemStack item = page.getItem(slot);
-                            if (item != null) {
-                                stmt.setString(1, playerId.toString());
-                                stmt.setInt(2, pageNumber);
-                                stmt.setInt(3, slot);
-                                stmt.setBytes(4, serializeItemStack(item));
-                                stmt.addBatch();
-                                batchCount++;
-                                
-                                // Execute batch every 100 items to avoid memory issues
-                                if (batchCount % 100 == 0) {
-                                    stmt.executeBatch();
-                                }
-                            }
+                    for (Map.Entry<Integer, VaultPage> entry : data.pages().entrySet()) {
+                        VaultPage page = entry.getValue();
+                        byte[] serialised = serializePage(page.contents());
+                        byte[] stored;
+                        boolean compressed = compressionEnabled
+                                && CompressionCodec.isWorthCompressing(serialised);
+                        if (compressed) {
+                            stored = CompressionCodec.compress(serialised, compressionLevel);
+                        } else {
+                            stored = serialised;
+                        }
+                        long newVersion = existingVersions.getOrDefault(entry.getKey(), 0L) + 1L;
+
+                        stmt.setString(1, playerId.toString());
+                        stmt.setInt(2, entry.getKey());
+                        stmt.setInt(3, page.getSize());
+                        stmt.setBytes(4, stored);
+                        stmt.setInt(5, compressed ? 1 : 0);
+                        stmt.setInt(6, serialised.length);
+                        stmt.setLong(7, newVersion);
+                        stmt.addBatch();
+                        batchCount++;
+                        if (batchCount % 64 == 0) {
+                            stmt.executeBatch();
                         }
                     }
-                    // Execute remaining batch
-                    if (batchCount % 100 != 0) {
+                    if (batchCount % 64 != 0) {
                         stmt.executeBatch();
                     }
                 }
 
                 conn.commit();
-                logger.fine("Saved data for player " + playerId);
-                
+                logger.fine("Saved data for player " + playerId + " ("
+                        + data.pages().size() + " pages, removed " + removed.size() + ")");
             } catch (Exception e) {
                 conn.rollback();
                 throw e;
@@ -347,9 +600,9 @@ public class MySqlStorage implements StorageManager {
         return CompletableFuture.runAsync(() -> {
             Set<UUID> dirtyPlayers = dataCache.getDirtyPlayers();
             logger.info("Saving " + dirtyPlayers.size() + " dirty player(s) to MySQL");
-            
+
             List<CompletableFuture<Void>> saveFutures = new ArrayList<>();
-            
+
             for (UUID playerId : dirtyPlayers) {
                 dataCache.get(playerId).ifPresent(data -> {
                     CompletableFuture<Void> saveFuture = savePlayerData(playerId, data)
@@ -361,23 +614,43 @@ public class MySqlStorage implements StorageManager {
                     saveFutures.add(saveFuture);
                 });
             }
-            
-            // Wait for all saves to complete
+
             CompletableFuture.allOf(saveFutures.toArray(new CompletableFuture[0])).join();
             logger.info("Completed saving all dirty players to MySQL");
-            
+
         }, asyncExecutor);
     }
 
     @Override
     public void close() {
         logger.info("Closing MySQL storage...");
-        
+
+        // Stop the metrics scheduler first so it cannot fire during shutdown
+        // and try to read pool counters off a closing data source.
+        ScheduledFuture<?> task = metricsTask;
+        ScheduledExecutorService exec = metricsExecutor;
+        metricsTask = null;
+        metricsExecutor = null;
+        if (task != null) {
+            task.cancel(false);
+        }
+        if (exec != null) {
+            exec.shutdown();
+            try {
+                if (!exec.awaitTermination(2, TimeUnit.SECONDS)) {
+                    exec.shutdownNow();
+                }
+            } catch (InterruptedException ie) {
+                exec.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
+
         if (dataSource != null && !dataSource.isClosed()) {
             dataSource.close();
             logger.info("HikariCP connection pool closed");
         }
-        
+
         asyncExecutor.shutdown();
         try {
             if (!asyncExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
@@ -389,9 +662,26 @@ public class MySqlStorage implements StorageManager {
         }
     }
 
-    /**
-     * Gets a connection from the pool.
-     */
+    @Override
+    public HikariPoolMXBean getHikariPoolMetrics() {
+        return dataSource == null ? null : dataSource.getHikariPoolMXBean();
+    }
+
+    @Override
+    public LatencyHistogram getSaveLatencyHistogram() {
+        return saveHistogram;
+    }
+
+    @Override
+    public LatencyHistogram getLoadLatencyHistogram() {
+        return loadHistogram;
+    }
+
+    @Override
+    public String getBackendTypeName() {
+        return "MYSQL";
+    }
+
     private Connection getConnection() throws SQLException {
         if (dataSource == null || dataSource.isClosed()) {
             throw new SQLException("Data source is not available");
@@ -399,13 +689,10 @@ public class MySqlStorage implements StorageManager {
         return dataSource.getConnection();
     }
 
-    /**
-     * Executes a database operation with exponential backoff retry logic.
-     */
     private <T> T executeWithRetry(SQLOperation<T> operation, String operationName) {
         int attempt = 0;
         long delay = INITIAL_RETRY_DELAY_MS;
-        
+
         while (attempt < MAX_RETRIES) {
             try {
                 return operation.execute();
@@ -415,49 +702,82 @@ public class MySqlStorage implements StorageManager {
                     logger.log(Level.SEVERE, "Failed to " + operationName + " after " + MAX_RETRIES + " attempts", e);
                     throw new RuntimeException("Database operation failed: " + operationName, e);
                 }
-                
+
                 logger.warning("Failed to " + operationName + " (attempt " + attempt + "/" + MAX_RETRIES + "), retrying in " + delay + "ms");
-                
+
                 try {
                     Thread.sleep(delay);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     throw new RuntimeException("Interrupted during retry", ie);
                 }
-                
+
                 delay *= 2; // Exponential backoff
             }
         }
-        
+
         throw new RuntimeException("Unexpected error in retry logic");
     }
 
     /**
-     * Serializes an ItemStack to a byte array.
+     * Serialise a page's contents to a raw {@code byte[]}. We always pay
+     * the Bukkit object-serialisation cost so the result is version-agnostic;
+     * the outer compression step (when enabled) hides most of the size.
+     * <p>
+     * Per-slot framing: a single byte {@code 0} marks an empty slot; the
+     * byte {@code 1} is followed by the serialised ItemStack. This avoids
+     * the trap where an empty-slot sentinel collides with the leading four
+     * bytes of a serialised stack.
      */
-    private byte[] serializeItemStack(ItemStack item) throws IOException {
-        try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-             BukkitObjectOutputStream dataOutput = new BukkitObjectOutputStream(outputStream)) {
-            
-            dataOutput.writeObject(item);
-            return outputStream.toByteArray();
+    private byte[] serializePage(ItemStack[] contents) throws IOException {
+        if (contents == null) {
+            contents = new ItemStack[0];
         }
+        ByteArrayOutputStream baos = new ByteArrayOutputStream(contents.length * 256);
+        try (BukkitObjectOutputStream boos = new BukkitObjectOutputStream(baos)) {
+            boos.writeInt(contents.length);
+            for (ItemStack stack : contents) {
+                if (stack == null || stack.getType().isAir()) {
+                    boos.writeByte(0);
+                } else {
+                    boos.writeByte(1);
+                    boos.writeObject(stack);
+                }
+            }
+        }
+        return baos.toByteArray();
     }
 
     /**
-     * Deserializes an ItemStack from a byte array.
+     * Inverse of {@link #serializePage(ItemStack[])}. Tolerates compressed
+     * and uncompressed inputs.
      */
-    private ItemStack deserializeItemStack(byte[] data) throws IOException, ClassNotFoundException {
-        try (ByteArrayInputStream inputStream = new ByteArrayInputStream(data);
-             BukkitObjectInputStream dataInput = new BukkitObjectInputStream(inputStream)) {
-            
-            return (ItemStack) dataInput.readObject();
+    private ItemStack[] decodePage(byte[] data, boolean compressed) throws IOException {
+        if (data == null || data.length == 0) {
+            return new ItemStack[0];
+        }
+        byte[] body = compressed ? CompressionCodec.decompress(data) : data;
+        if (body == null) {
+            throw new IOException("Failed to decode page payload");
+        }
+        try (BukkitObjectInputStream bis = new BukkitObjectInputStream(new ByteArrayInputStream(body))) {
+            int count = bis.readInt();
+            ItemStack[] contents = new ItemStack[count];
+            for (int i = 0; i < count; i++) {
+                int sentinel = bis.readByte();
+                if (sentinel == 0) {
+                    contents[i] = null;
+                } else {
+                    Object obj = bis.readObject();
+                    contents[i] = obj instanceof ItemStack stack ? stack : null;
+                }
+            }
+            return contents;
+        } catch (ClassNotFoundException ex) {
+            throw new IOException("ItemStack class missing on this server", ex);
         }
     }
 
-    /**
-     * Functional interface for SQL operations that can throw SQLException or IOException.
-     */
     @FunctionalInterface
     private interface SQLOperation<T> {
         T execute() throws SQLException, IOException;

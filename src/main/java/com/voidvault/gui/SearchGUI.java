@@ -1,36 +1,60 @@
 package com.voidvault.gui;
 
+import com.voidvault.config.ConfigManager;
+import com.voidvault.config.ConfigManager.SearchGuiButton;
+import com.voidvault.config.ConfigManager.SearchGuiRole;
+import com.voidvault.config.MessageManager;
 import com.voidvault.manager.VaultManager;
 import org.bukkit.Bukkit;
-import org.bukkit.Material;
 import org.bukkit.entity.Player;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
-import org.bukkit.inventory.meta.ItemMeta;
 
-import java.util.Arrays;
-import java.util.List;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * Search GUI for filtering vault items.
- * Provides a user-friendly interface with predefined search options and chat input.
+ *
+ * <p>Provides a user-friendly overlay with predefined quick-search options,
+ * a custom chat-prompt option, a clear-filter button and a cancel button.</p>
+ *
+ * <p>All visible text — the inventory title, every button's display name /
+ * lore and every chat prompt — is loaded from {@link ConfigManager} and
+ * {@link MessageManager} so authors can rebrand the overlay without
+ * touching this class. The class itself holds no {@code §}-style colour
+ * strings.</p>
  */
 public class SearchGUI {
-    
+
     private final Player player;
     private final int page;
     private final VaultManager vaultManager;
+    private final ConfigManager configManager;
+    private final MessageManager messageManager;
     private final Inventory inventory;
-    
-    public SearchGUI(Player player, int page, VaultManager vaultManager) {
+
+    /**
+     * Slot → button lookup, rebuilt on every {@link #setupInventory()} call so
+     * the GUI always reflects the latest config.yml contents.
+     */
+    private final Map<Integer, SearchGuiButton> buttonsBySlot = new HashMap<>();
+
+    public SearchGUI(Player player,
+                     int page,
+                     VaultManager vaultManager,
+                     ConfigManager configManager,
+                     MessageManager messageManager) {
         this.player = player;
         this.page = page;
         this.vaultManager = vaultManager;
-        this.inventory = Bukkit.createInventory(null, 27, "§5§lSearch Vault");
+        this.configManager = configManager;
+        this.messageManager = messageManager;
+        this.inventory = Bukkit.createInventory(null, 27, configManager.getSearchGuiTitle());
     }
-    
+
     /**
      * Open the search GUI for the player.
      */
@@ -38,90 +62,91 @@ public class SearchGUI {
         setupInventory();
         player.openInventory(inventory);
     }
-    
+
     /**
      * Set up the search GUI inventory with buttons.
+     *
+     * <p>Reads every button definition from {@link ConfigManager}, applies the
+     * filler glass pane to all unused slots, then renders the buttons at
+     * their configured slots. Anything missing from config.yml falls back to
+     * the defaults baked into {@link SearchGuiButton#defaultQuickOptions()}
+     * and the hard-coded role-aware fallback in
+     * {@link ConfigManager#loadSearchGui()}.</p>
      */
     private void setupInventory() {
-        // Fill with glass panes
-        ItemStack filler = createItem(Material.GRAY_STAINED_GLASS_PANE, " ", null);
+        // Rebuild the slot map every time so config reloads are reflected
+        // immediately on next open.
+        buttonsBySlot.clear();
+
+        // 1. Fill every slot with the configured filler glass pane so the
+        //    overlay looks uniform before the buttons paint over their slots.
+        ItemStack filler = configManager.getSearchGuiFiller().toItemStack();
         for (int i = 0; i < 27; i++) {
             inventory.setItem(i, filler);
         }
-        
-        // Quick search options
-        inventory.setItem(10, createItem(Material.DIAMOND, "§b§lDiamond Items",
-            Arrays.asList("§7Search for diamond items")));
-        
-        inventory.setItem(11, createItem(Material.IRON_INGOT, "§7§lIron Items",
-            Arrays.asList("§7Search for iron items")));
-        
-        inventory.setItem(12, createItem(Material.GOLD_INGOT, "§e§lGold Items",
-            Arrays.asList("§7Search for gold items")));
-        
-        inventory.setItem(13, createItem(Material.NETHERITE_INGOT, "§8§lNetherite Items",
-            Arrays.asList("§7Search for netherite items")));
-        
-        inventory.setItem(14, createItem(Material.WOODEN_SWORD, "§6§lTools & Weapons",
-            Arrays.asList("§7Search for tools and weapons")));
-        
-        inventory.setItem(15, createItem(Material.DIAMOND_CHESTPLATE, "§9§lArmor",
-            Arrays.asList("§7Search for armor pieces")));
-        
-        inventory.setItem(16, createItem(Material.COBBLESTONE, "§7§lBlocks",
-            Arrays.asList("§7Search for blocks")));
-        
-        // Custom search button
-        inventory.setItem(22, createItem(Material.NAME_TAG, "§e§lCustom Search",
-            Arrays.asList("§7Click to type your own search", "§7Type in chat after clicking")));
-        
-        // Clear filter button
-        inventory.setItem(24, createItem(Material.BARRIER, "§c§lClear Filter",
-            Arrays.asList("§7Click to show all items")));
-        
-        // Cancel button
-        inventory.setItem(26, createItem(Material.RED_STAINED_GLASS_PANE, "§c§lCancel",
-            Arrays.asList("§7Return to vault")));
+
+        // 2. Render the seven quick-search buttons.
+        for (SearchGuiButton button : configManager.getSearchGuiQuickOptions()) {
+            placeButton(button);
+        }
+
+        // 3. Render the three role buttons. Each one is configurable but the
+        //    role is fixed, so we can fall back to defaults safely.
+        placeButton(configManager.getSearchGuiCustomButton());
+        placeButton(configManager.getSearchGuiClearButton());
+        placeButton(configManager.getSearchGuiCancelButton());
     }
-    
+
+    /**
+     * Place a configured button into its target slot and remember the mapping
+     * so {@link #handleClick(InventoryClickEvent)} can dispatch on it.
+     */
+    private void placeButton(SearchGuiButton button) {
+        if (button == null) {
+            return;
+        }
+        inventory.setItem(button.slot(), button.toItemStack());
+        // Last write wins. Authors can override slots freely; if two buttons
+        // happen to share a slot we surface the second one's behaviour.
+        buttonsBySlot.put(button.slot(), button);
+    }
+
     /**
      * Handle click events in the search GUI.
      */
     public void handleClick(InventoryClickEvent event) {
         event.setCancelled(true);
-        
+
         int slot = event.getSlot();
-        
-        switch (slot) {
-            case 10 -> processSearch("diamond");
-            case 11 -> processSearch("iron");
-            case 12 -> processSearch("gold");
-            case 13 -> processSearch("netherite");
-            case 14 -> processSearch("sword pickaxe axe shovel hoe");
-            case 15 -> processSearch("helmet chestplate leggings boots");
-            case 16 -> processSearch("stone dirt cobblestone");
-            case 22 -> promptCustomSearch();
-            case 24 -> clearFilter();
-            case 26 -> cancel();
+        SearchGuiButton button = buttonsBySlot.get(slot);
+        if (button == null) {
+            return;
+        }
+
+        switch (button.role()) {
+            case QUICK_OPTION  -> processSearch(button.query());
+            case CUSTOM_SEARCH -> promptCustomSearch();
+            case CLEAR_FILTER  -> clearFilter();
+            case CANCEL        -> cancel();
         }
     }
-    
+
     /**
      * Handle inventory close event.
      */
     public void handleClose(InventoryCloseEvent event) {
         // Clean up if needed
     }
-    
+
     /**
      * Prompt player to type custom search in chat.
      */
     private void promptCustomSearch() {
         player.closeInventory();
         vaultManager.getSearchManager().startSearch(player, page);
-        player.sendMessage("§5§l[VoidVault] §bType your search query in chat (or 'cancel' to exit):");
+        messageManager.send(player, "vault.search-prompt-raw");
     }
-    
+
     /**
      * Process the search query.
      */
@@ -130,27 +155,28 @@ public class SearchGUI {
             cancel();
             return;
         }
-        
+
         // Set search query in manager
         vaultManager.getSearchManager().startSearch(player, page);
         vaultManager.getSearchManager().setSearchQuery(player, query.trim());
-        
+
         // Close GUI and reopen vault with filter
         player.closeInventory();
-        player.sendMessage("§5§l[VoidVault] §bSearching for: §e" + query.trim());
+        messageManager.send(player, "vault.search-starting",
+                Map.of("query", query.trim()));
         vaultManager.openVault(player, page);
     }
-    
+
     /**
      * Clear the search filter.
      */
     private void clearFilter() {
         vaultManager.getSearchManager().clearSearch(player);
         player.closeInventory();
-        player.sendMessage("§5§l[VoidVault] §aSearch filter cleared!");
+        messageManager.send(player, "vault.search-cleared");
         vaultManager.openVault(player, page);
     }
-    
+
     /**
      * Cancel and return to vault.
      */
@@ -158,23 +184,7 @@ public class SearchGUI {
         player.closeInventory();
         vaultManager.openVault(player, page);
     }
-    
-    /**
-     * Create an ItemStack with display name and lore.
-     */
-    private ItemStack createItem(Material material, String name, List<String> lore) {
-        ItemStack item = new ItemStack(material);
-        ItemMeta meta = item.getItemMeta();
-        if (meta != null) {
-            meta.setDisplayName(name);
-            if (lore != null) {
-                meta.setLore(lore);
-            }
-            item.setItemMeta(meta);
-        }
-        return item;
-    }
-    
+
     /**
      * Get the inventory.
      */

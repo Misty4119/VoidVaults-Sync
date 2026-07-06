@@ -1,10 +1,12 @@
 package com.voidvault.command;
 
+import com.voidvault.config.ConfigManager;
 import com.voidvault.config.MessageManager;
+import com.voidvault.config.PluginMode;
 import com.voidvault.manager.CooldownManager;
-import com.voidvault.manager.EconomyManager;
 import com.voidvault.manager.PermissionManager;
 import com.voidvault.manager.VaultManager;
+import com.voidvault.util.ValidationUtil;
 import org.bukkit.Sound;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
@@ -17,6 +19,8 @@ import java.util.logging.Logger;
 /**
  * Command executor for remote vault access.
  * Handles /echest, /pv, and /vault commands.
+ * Supports an optional page argument (e.g. /pv 3) to jump directly to a page
+ * in PAGED mode. The page argument is ignored in SIMPLE mode.
  * Implements permission checks, cooldown enforcement, and economy integration.
  */
 public class EChestCommand implements CommandExecutor {
@@ -25,21 +29,21 @@ public class EChestCommand implements CommandExecutor {
     private final VaultManager vaultManager;
     private final PermissionManager permissionManager;
     private final CooldownManager cooldownManager;
-    private final EconomyManager economyManager;
     private final MessageManager messageManager;
-    
+    private final ConfigManager configManager;
+
     public EChestCommand(Plugin plugin, VaultManager vaultManager, PermissionManager permissionManager,
-                         CooldownManager cooldownManager, EconomyManager economyManager,
-                         MessageManager messageManager) {
+                         CooldownManager cooldownManager, MessageManager messageManager,
+                         ConfigManager configManager) {
         this.plugin = plugin;
         this.logger = plugin.getLogger();
         this.vaultManager = vaultManager;
         this.permissionManager = permissionManager;
         this.cooldownManager = cooldownManager;
-        this.economyManager = economyManager;
         this.messageManager = messageManager;
+        this.configManager = configManager;
     }
-    
+
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         // Must be a player
@@ -48,16 +52,43 @@ public class EChestCommand implements CommandExecutor {
             messageManager.send(sender, "commands.player-only");
             return true;
         }
-        
+
         logger.fine("Player " + player.getName() + " attempting remote vault access via /" + label);
-        
+
         // Check remote access permission
         if (!permissionManager.hasRemoteAccess(player)) {
             logger.fine("Player " + player.getName() + " denied remote access: missing voidvaults.remote permission");
             messageManager.send(player, "commands.no-permission");
             return true;
         }
-        
+
+        // Determine target page.
+        // SIMPLE mode ignores any supplied page argument.
+        // PAGED mode honors the optional argument and clamps to the player's max.
+        int targetPage = 1;
+        PluginMode mode = configManager.getPluginMode();
+        if (mode == PluginMode.PAGED && args.length >= 1) {
+            Integer parsed = ValidationUtil.parsePositiveInteger(args[0]);
+            if (parsed == null) {
+                messageManager.send(player, "commands.invalid-number",
+                    MessageManager.placeholders()
+                        .add("input", args[0])
+                        .build());
+                return true;
+            }
+            int maxAllowedPages = permissionManager.getMaxPages(player);
+            if (parsed > maxAllowedPages) {
+                messageManager.send(player, "remote-access.page-out-of-range",
+                    MessageManager.placeholders()
+                        .add("page", parsed)
+                        .add("max", maxAllowedPages)
+                        .build());
+                return true;
+            }
+            targetPage = parsed;
+            logger.fine("Player " + player.getName() + " requested page " + targetPage + " via /" + label);
+        }
+
         // Check cooldown (unless player has bypass permission)
         if (!permissionManager.canBypassCooldown(player)) {
             if (cooldownManager.isOnCooldown(player)) {
@@ -72,102 +103,51 @@ public class EChestCommand implements CommandExecutor {
         } else {
             logger.fine("Player " + player.getName() + " bypassing cooldown check");
         }
-        
-        // Check and charge economy fee if enabled
-        double economyFee = plugin.getConfig().getDouble("remote-access.economy-fee", 0.0);
-        if (economyManager.isEnabled() && economyFee > 0) {
-            logger.fine("Economy integration enabled, checking balance for " + player.getName() + " (fee: " + economyFee + ")");
-            
-            if (!economyManager.hasBalance(player, economyFee)) {
-                String formattedAmount = economyManager.formatAmount(economyFee);
-                logger.fine("Player " + player.getName() + " has insufficient funds for remote access");
-                messageManager.send(player, "remote-access.insufficient-funds",
-                    MessageManager.placeholders()
-                        .add("amount", formattedAmount)
-                        .build());
-                return true;
-            }
-            
-            // Withdraw the fee
-            if (!economyManager.withdraw(player, economyFee)) {
-                logger.warning("Failed to withdraw economy fee from " + player.getName() + " (amount: " + economyFee + ")");
-                messageManager.send(player, "error.economy-transaction-failed");
-                return true;
-            }
-            
-            // Notify player of charge
-            String formattedAmount = economyManager.formatAmount(economyFee);
-            logger.fine("Charged " + formattedAmount + " to " + player.getName() + " for remote access");
-            messageManager.send(player, "remote-access.fee-charged",
-                MessageManager.placeholders()
-                    .add("amount", formattedAmount)
-                    .build());
-        } else {
-            logger.fine("Economy integration disabled or fee is 0, skipping fee check");
-        }
-        
+
         // Set cooldown (unless player has bypass permission)
         if (!permissionManager.canBypassCooldown(player)) {
             cooldownManager.setCooldown(player);
             logger.fine("Cooldown set for " + player.getName());
         }
-        
+
         // Play chest opening sound at player location
         player.playSound(player.getLocation(), Sound.BLOCK_ENDER_CHEST_OPEN, 1.0f, 1.0f);
-        
-        // Store fee for potential refund
-        final double chargedFee = economyFee;
-        final boolean feeWasCharged = economyManager.isEnabled() && economyFee > 0;
-        
+
+        final int finalPage = targetPage;
+
         // Open vault asynchronously
-        logger.info("Opening remote vault for " + player.getName());
+        logger.info("Opening remote vault for " + player.getName() + " (page " + finalPage + ")");
         messageManager.send(player, "vault.opening");
-        
-        vaultManager.openVault(player, 1).exceptionally(ex -> {
+
+        vaultManager.openVault(player, finalPage).exceptionally(ex -> {
             // Detailed error logging for different failure scenarios
             String errorType = ex.getClass().getSimpleName();
             String errorMessage = ex.getMessage() != null ? ex.getMessage() : "Unknown error";
-            
+
             logger.severe("=== Remote Vault Access Failure ===");
             logger.severe("Player: " + player.getName() + " (UUID: " + player.getUniqueId() + ")");
             logger.severe("Command: /" + label);
             logger.severe("Error Type: " + errorType);
             logger.severe("Error Message: " + errorMessage);
             logger.severe("Stack trace:");
-            ex.printStackTrace();
+            logger.log(java.util.logging.Level.SEVERE, "Exception details:", ex);
             logger.severe("===================================");
-            
+
             // Send user-friendly error message
             messageManager.send(player, "error.load-failed");
-            
-            // Attempt to refund the economy fee if vault opening failed
-            if (feeWasCharged) {
-                boolean refunded = economyManager.deposit(player, chargedFee);
-                if (refunded) {
-                    String formattedAmount = economyManager.formatAmount(chargedFee);
-                    logger.info("Refunded " + formattedAmount + " to " + player.getName() + " due to vault opening failure");
-                    messageManager.send(player, "remote-access.fee-refunded",
-                        MessageManager.placeholders()
-                            .add("amount", formattedAmount)
-                            .build());
-                } else {
-                    logger.warning("Failed to refund fee to " + player.getName() + 
-                        " - manual intervention may be required");
-                }
-            }
-            
+
             // Clear cooldown since the operation failed
             if (!permissionManager.canBypassCooldown(player)) {
                 cooldownManager.clearCooldown(player);
                 logger.info("Cleared cooldown for " + player.getName() + " due to vault opening failure");
             }
-            
+
             return null;
         }).thenRun(() -> {
             // Success logging
             logger.info("Successfully opened remote vault for " + player.getName());
         });
-        
+
         return true;
     }
 }

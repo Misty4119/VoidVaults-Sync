@@ -62,7 +62,7 @@ public class PlayerConnectionListener implements Listener {
             .exceptionally(ex -> {
                 // Log error and create empty data as fallback
                 logger.severe("Failed to load vault data for " + player.getName() + ": " + ex.getMessage());
-                ex.printStackTrace();
+                logger.log(java.util.logging.Level.SEVERE, "Exception details:", ex);
                 
                 // Create and cache empty data to prevent issues
                 PlayerVaultData emptyData = PlayerVaultData.createEmpty(playerId);
@@ -87,7 +87,7 @@ public class PlayerConnectionListener implements Listener {
         if (vaultManager.hasOpenVault(player)) {
             vaultManager.closeVault(player).exceptionally(ex -> {
                 logger.severe("Failed to close vault for " + player.getName() + " on quit: " + ex.getMessage());
-                ex.printStackTrace();
+                logger.log(java.util.logging.Level.SEVERE, "Exception details:", ex);
                 return null;
             });
         }
@@ -115,7 +115,7 @@ public class PlayerConnectionListener implements Listener {
             .exceptionally(ex -> {
                 // Log error but still remove from cache
                 logger.severe("Failed to save vault data for " + player.getName() + " on quit: " + ex.getMessage());
-                ex.printStackTrace();
+                logger.log(java.util.logging.Level.SEVERE, "Exception details:", ex);
                 
                 // Still remove from cache to prevent memory leaks
                 dataCache.remove(playerId);

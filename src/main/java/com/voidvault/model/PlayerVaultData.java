@@ -9,9 +9,19 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Immutable record representing a player's complete vault data.
  * Uses Java 21 record syntax for concise, thread-safe data carrier.
+ * <p>
+ * Cross-thread access requires a defensive copy via
+ * {@link com.voidvault.model.VaultDataCloner#deepClone(PlayerVaultData)}.
+ * The compact constructor shallow-copies the {@code pages} map and each
+ * VaultPage deep-clones its ItemStack array, so once a PlayerVaultData has
+ * been created, hand the SAME instance to a different thread only when you
+ * are sure no further mutation will happen on the original thread; if you
+ * cannot guarantee that, clone first.
  *
  * @param playerId     The unique identifier of the player
- * @param pages        Map of page numbers to VaultPage objects
+ * @param pages        Map of page numbers to VaultPage objects. Cross-thread
+ *                     access requires a defensive copy via
+ *                     {@link com.voidvault.model.VaultDataCloner#deepClone(PlayerVaultData)}.
  * @param customSlots  Custom slot override (0 = use permissions)
  * @param customPages  Custom page override (0 = use permissions)
  */

@@ -39,7 +39,6 @@ public class EconomyManager {
             .getRegistration(Economy.class);
             
         if (rsp == null) {
-            logger.warning("Vault found but no economy provider detected. Economy features disabled.");
             enabled = false;
             return;
         }
