@@ -69,9 +69,9 @@ public class SearchGUI {
      * <p>Reads every button definition from {@link ConfigManager}, applies the
      * filler glass pane to all unused slots, then renders the buttons at
      * their configured slots. Anything missing from config.yml falls back to
-     * the defaults baked into {@link SearchGuiButton#defaultQuickOptions()}
-     * and the hard-coded role-aware fallback in
-     * {@link ConfigManager#loadSearchGui()}.</p>
+     * the defaults read from the bundled {@code config.yml} template via
+     * {@link SearchGuiButton#defaultQuickOptions(FileConfiguration)} and the
+     * role-aware fallback in {@link ConfigManager#loadSearchGui()}.</p>
      */
     private void setupInventory() {
         // Rebuild the slot map every time so config reloads are reflected

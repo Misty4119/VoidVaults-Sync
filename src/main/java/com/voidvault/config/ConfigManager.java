@@ -12,6 +12,10 @@ import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.Plugin;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.logging.Logger;
@@ -24,6 +28,7 @@ public class ConfigManager {
     private final Plugin plugin;
     private final Logger logger;
     private FileConfiguration config;
+    private FileConfiguration bundledTemplate;
     
     // Cached configuration values
     private PluginMode pluginMode;
@@ -90,6 +95,8 @@ public class ConfigManager {
         // Reload config from disk
         plugin.reloadConfig();
         config = plugin.getConfig();
+
+        loadBundledTemplate();
         
         // Load and validate all configuration values.
         // Order matters: loadVaultSettings() (which fills maxPages) must run
@@ -108,6 +115,28 @@ public class ConfigManager {
         loadSearchGui();
         
         logger.info("Configuration loaded successfully. Mode: " + pluginMode);
+    }
+
+    /**
+     * Load the bundled {@code config.yml} template from the plugin jar
+     * into a read-only {@link FileConfiguration}. Stored in
+     * {@link #bundledTemplate} so any code path that needs a default value
+     * (e.g. the search-gui quick-options fallback) can read it from the
+     * YAML file directly instead of carrying its own copy.
+     */
+    private void loadBundledTemplate() {
+        try (InputStream stream = plugin.getResource("config.yml")) {
+            if (stream == null) {
+                logger.warning("Bundled config.yml not found in jar; default fallbacks disabled.");
+                bundledTemplate = null;
+                return;
+            }
+            bundledTemplate = org.bukkit.configuration.file.YamlConfiguration.loadConfiguration(
+                    new InputStreamReader(stream, StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            logger.warning("Could not load bundled config.yml template: " + e.getMessage());
+            bundledTemplate = null;
+        }
     }
     
     /**
@@ -174,9 +203,11 @@ public class ConfigManager {
 
     /**
      * Load the search overlay's title, filler and clickable buttons from the
-     * {@code search-gui.*} section of config.yml. Anything missing falls back
-     * to a hard-coded sensible default so the overlay still opens on a fresh
-     * server even before the user has edited the file.
+     * {@code search-gui.*} section of config.yml. Anything missing from the
+     * on-disk config falls back to the bundled config.yml template (loaded
+     * by {@link #loadBundledTemplate()}) so the overlay still opens on a
+     * fresh server without forcing Java to carry a duplicate copy of the
+     * default strings.
      *
      * <p>Quick-option buttons are loaded as a list keyed by an explicit
      * {@code id}, then re-indexed by slot to keep the lookup logic in
@@ -206,10 +237,12 @@ public class ConfigManager {
             }
         } else {
             // Backstop: ship a sensible default set so the GUI is usable
-            // out-of-the-box without any author intervention. Anything
-            // authors write to config.yml wins over these defaults.
-            quick.addAll(SearchGuiButton.defaultQuickOptions());
-            logger.info("search-gui.quick-options not configured — using built-in defaults.");
+            // out-of-the-box without any author intervention. Defaults are
+            // pulled straight from the bundled config.yml template so
+            // authors never see two divergent copies of the same strings
+            // — config.yml stays the single source of truth.
+            quick.addAll(SearchGuiButton.defaultQuickOptions(bundledTemplate));
+            logger.info("search-gui.quick-options not configured — using defaults from bundled config.yml.");
         }
         searchGuiQuickOptions = java.util.List.copyOf(quick);
 
@@ -980,43 +1013,95 @@ public class ConfigManager {
 
         /**
          * Default quick-options used when the {@code search-gui.quick-options}
-         * section is missing from config.yml. Keeping them here (rather than
-         * hard-coding the same MiniMessage into Java twice) ensures the
-         * out-of-the-box overlay matches what authors see in the YAML file.
+         * section is missing from {@code config.yml}. The defaults are
+         * <strong>read from the bundled config template</strong>
+         * (the same {@code config.yml} shipped inside the plugin jar),
+         * not hard-coded here, so the Java source and the YAML file never
+         * drift apart. {@code config.yml} stays the single source of truth
+         * for every display-name, lore line, query and slot.
+         *
+         * <p>The fallback ids and rendering order come from
+         * {@link #defaultQuickOptionIds}; if the bundled template lacks
+         * one of them that entry is silently skipped (the overlay still
+         * opens, it just shows one fewer button).</p>
+         *
+         * @param templateConfig the read-only template configuration
+         *                       loaded from the plugin jar's
+         *                       {@code config.yml}; may be {@code null}
+         *                       (in which case an empty list is returned)
          */
-        public static List<SearchGuiButton> defaultQuickOptions() {
-            return List.of(
-                    new SearchGuiButton("diamond", 10, Material.DIAMOND,
-                            "<aqua><bold>◇ Diamond Items</bold></aqua>",
-                            List.of("<gray>Search for any diamond item.</gray>"),
-                            false, "diamond", SearchGuiRole.QUICK_OPTION),
-                    new SearchGuiButton("iron", 11, Material.IRON_INGOT,
-                            "<white><bold>◇ Iron Items</bold></white>",
-                            List.of("<gray>Search for any iron item.</gray>"),
-                            false, "iron", SearchGuiRole.QUICK_OPTION),
-                    new SearchGuiButton("gold", 12, Material.GOLD_INGOT,
-                            "<yellow><bold>◇ Gold Items</bold></yellow>",
-                            List.of("<gray>Search for any gold item.</gray>"),
-                            false, "gold", SearchGuiRole.QUICK_OPTION),
-                    new SearchGuiButton("netherite", 13, Material.NETHERITE_INGOT,
-                            "<dark_gray><bold>◇ Netherite Items</bold></dark_gray>",
-                            List.of("<gray>Search for any netherite item.</gray>"),
-                            true, "netherite", SearchGuiRole.QUICK_OPTION),
-                    new SearchGuiButton("tools-weapons", 14, Material.WOODEN_SWORD,
-                            "<gold><bold>◇ Tools &amp; Weapons</bold></gold>",
-                            List.of("<gray>Search for tools and weapons.</gray>"),
-                            false, "sword pickaxe axe shovel hoe",
-                            SearchGuiRole.QUICK_OPTION),
-                    new SearchGuiButton("armor", 15, Material.DIAMOND_CHESTPLATE,
-                            "<light_purple><bold>◇ Armor</bold></light_purple>",
-                            List.of("<gray>Search for armour pieces.</gray>"),
-                            false, "helmet chestplate leggings boots",
-                            SearchGuiRole.QUICK_OPTION),
-                    new SearchGuiButton("blocks", 16, Material.COBBLESTONE,
-                            "<gray><bold>◇ Blocks</bold></gray>",
-                            List.of("<gray>Search for common building blocks.</gray>"),
-                            false, "stone dirt cobblestone", SearchGuiRole.QUICK_OPTION)
-            );
+        public static List<SearchGuiButton> defaultQuickOptions(FileConfiguration templateConfig) {
+            if (templateConfig == null) {
+                return List.of();
+            }
+            ConfigurationSection section = templateConfig.getConfigurationSection("search-gui.quick-options");
+            if (section == null) {
+                return List.of();
+            }
+            List<SearchGuiButton> buttons = new ArrayList<>(defaultQuickOptionIds.length);
+            for (String id : defaultQuickOptionIds) {
+                ConfigurationSection entry = section.getConfigurationSection(id);
+                if (entry == null) {
+                    continue;
+                }
+                SearchGuiButton btn = loadFromTemplate(entry, id);
+                if (btn != null) {
+                    buttons.add(btn);
+                }
+            }
+            return List.copyOf(buttons);
+        }
+
+        /**
+         * Stable ids and rendering order for the out-of-the-box
+         * quick-search buttons. The actual MiniMessage strings
+         * (display-name, lore, query, material, glow) all live in
+         * {@code src/main/resources/config.yml} and are resolved through
+         * {@link #defaultQuickOptions(FileConfiguration)} — this array is
+         * the only piece of fallback data kept in code.
+         */
+        public static final String[] defaultQuickOptionIds = new String[]{
+                "diamond",
+                "iron",
+                "gold",
+                "netherite",
+                "tools-weapons",
+                "armor",
+                "blocks"
+        };
+
+        /**
+         * Build a {@link SearchGuiButton} from a template
+         * {@link ConfigurationSection}. Mirrors the validation rules used
+         * by {@link ConfigManager#loadSearchGuiButton(ConfigurationSection, String, String)}
+         * so template-loaded buttons are indistinguishable from on-disk
+         * ones at render time.
+         *
+         * @param section the template section
+         * @param id      the stable id of the entry
+         * @return a parsed button, or {@code null} if the entry is invalid
+         */
+        private static SearchGuiButton loadFromTemplate(ConfigurationSection section, String id) {
+            if (section == null) {
+                return null;
+            }
+            int slot = section.getInt("slot", -1);
+            if (slot < 0 || slot > 26) {
+                return null;
+            }
+            String query = section.getString("query");
+            if (query == null || query.isBlank()) {
+                return null;
+            }
+            Material material = Material.getMaterial(section.getString("material", "STONE"));
+            if (material == null) {
+                material = Material.STONE;
+            }
+            String displayName = section.getString("display-name", "<white>Search</white>");
+            List<String> lore = section.getStringList("lore");
+            boolean glow = section.getBoolean("glow", false);
+            return new SearchGuiButton(id, slot, material, displayName, lore, glow,
+                    query, SearchGuiRole.QUICK_OPTION);
         }
     }
 }
