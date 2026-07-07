@@ -272,7 +272,7 @@ items:
     glow: false
 
   # Sort button - organizes items in the current page by category then name
-  sort-button:
+  sort:
     material: HOPPER
     display-name: "<gradient:#9CC3FF:#D9B3FF><bold>⇅ Sort Items</bold></gradient>"
     lore:
@@ -290,7 +290,7 @@ items:
     glow: false
 
   # Search/Filter button - filters items by name
-  search-button:
+  search:
     material: COMPASS
     display-name: "<gradient:#9CC3FF:#D9B3FF><bold>◎ Search Items</bold></gradient>"
     lore:
