@@ -1,5 +1,5 @@
 name: VoidVaults
-version: 2.1.0
+version: 2.3.0
 main: com.voidvault.VoidVaultPlugin
 api-version: '26.1.2'
 folia-supported: true

@@ -248,16 +248,16 @@ public class RedisStorageManager implements StorageManager {
                             Thread.sleep(50L);
                         } catch (InterruptedException ie) {
                             Thread.currentThread().interrupt();
-                            return;
+                            throw new java.util.concurrent.CompletionException(ie);
                         }
                         if (lock.tryAcquire(playerId, token, lockTtlMs) != null) {
                             acquired = true;
                         }
                     }
                     if (!acquired) {
-                        logger.warning("Could not acquire Redis write lock for " + playerId
-                                + " after retries; aborting save (data will be retried by auto-save)");
-                        return;
+                        throw new java.util.concurrent.CompletionException(
+                                new IllegalStateException("Could not acquire Redis write lock for "
+                                        + playerId + " after retries"));
                     }
                 }
                 try {
@@ -277,9 +277,7 @@ public class RedisStorageManager implements StorageManager {
         String pagesKey = RedisKeyLayout.pagesIndex(prefix, playerId);
         String legacyKey = RedisKeyLayout.legacyKey(prefix, playerId);
 
-        long version = localVersion
-                .computeIfAbsent(playerId, k -> new AtomicLong(0L))
-                .incrementAndGet();
+        long version;
 
         // Encode all pages with optional compression. The encoding work is
         // done off the Jedis connection so we minimise the time we hold a
@@ -306,6 +304,14 @@ public class RedisStorageManager implements StorageManager {
         Set<Integer> removed = new HashSet<>();
 
         try (Jedis jedis = connection.getPool().getResource()) {
+            // The distributed lock serialises writers for this player. Read
+            // the authoritative Redis version while holding it so versions
+            // remain monotonic across nodes and process restarts.
+            String storedVersion = jedis.hget(metaKey, RedisKeyLayout.META_FIELD_VERSION);
+            long previousVersion = parseLongOrZero(storedVersion);
+            version = Math.max(previousVersion,
+                    localVersion.computeIfAbsent(playerId, k -> new AtomicLong(0L)).get()) + 1L;
+            localVersion.get(playerId).set(version);
             // First, figure out which pages existed before so we can delete
             // ones that are no longer present in the new payload.
             Map<String, String> existingIndex = jedis.hgetAll(pagesKey);
@@ -393,6 +399,15 @@ public class RedisStorageManager implements StorageManager {
         // a Jedis resource while we do network I/O on the pub/sub channel.
         if (connection.getConfig().isPublishOnSave()) {
             publishInvalidation(playerId, version, newPages, removed);
+        }
+    }
+
+    private static long parseLongOrZero(String value) {
+        if (value == null) return 0L;
+        try {
+            return Math.max(0L, Long.parseLong(value));
+        } catch (NumberFormatException ignored) {
+            return 0L;
         }
     }
 

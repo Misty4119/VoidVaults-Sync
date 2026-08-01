@@ -167,21 +167,32 @@ public class MySqlStorage implements StorageManager {
                 config.getString("mysql.host", "localhost"));
         int port = config.getInt("storage.mysql.port",
                 config.getInt("mysql.port", 3306));
+        host = requireSafeHost(host, "storage.mysql.host");
+        if (port < 1 || port > 65535) {
+            throw new IllegalArgumentException("storage.mysql.port must be between 1 and 65535");
+        }
         String database = config.getString("storage.mysql.database",
                 config.getString("mysql.database", "voidvault"));
+        database = requireSafeIdentifier(database, "storage.mysql.database");
         String username = config.getString("storage.mysql.username",
                 config.getString("mysql.username", "root"));
         String password = config.getString("storage.mysql.password",
-                config.getString("mysql.password", "password"));
+                config.getString("mysql.password", ""));
+        if ("change-me".equals(password) || "password".equalsIgnoreCase(password)) {
+            throw new IllegalArgumentException(
+                    "Refusing insecure default MySQL password; configure storage.mysql.password");
+        }
         int poolSize = config.getInt("storage.mysql.pool-size",
                 config.getInt("mysql.pool-size", 30));
         int connectionTimeoutMs = config.getInt("storage.mysql.connection-timeout-ms", 3000);
         long leakDetectionThresholdMs = config.getLong("storage.mysql.leak-detection-threshold-ms", 10000L);
+        String sslMode = requireSslMode(config.getString("storage.mysql.ssl-mode", "VERIFY_IDENTITY"));
 
         // Step 1: Connect without database name to create the database if needed
         String baseJdbcUrl = "jdbc:mysql://" + host + ":" + port
-                + "/?useSSL=false&allowPublicKeyRetrieval=true&characterEncoding=utf8";
-        try (var tempDs = new HikariDataSource(buildTempConfig(baseJdbcUrl, username, password));
+                + "/?sslMode=" + sslMode + "&allowPublicKeyRetrieval=false&characterEncoding=utf8";
+        try (var tempDs = new HikariDataSource(buildTempConfig(
+                baseJdbcUrl, username, password, connectionTimeoutMs));
              Connection conn = tempDs.getConnection();
              Statement stmt = conn.createStatement()) {
             stmt.executeUpdate("CREATE DATABASE IF NOT EXISTS `" + database
@@ -189,7 +200,8 @@ public class MySqlStorage implements StorageManager {
             logger.info("Database '" + database + "' ensured to exist");
         } catch (SQLException e) {
             logger.warning("Could not auto-create database '" + database
-                    + "' (will try connecting anyway): " + e.getMessage());
+                    + "' at " + host + ":" + port + " (will try connecting anyway): "
+                    + describeConnectionFailure(e));
         }
 
         // Step 2: Build the real connection pool with the target database.
@@ -197,7 +209,7 @@ public class MySqlStorage implements StorageManager {
         // map-painting NBT) don't dominate the network round-trip between
         // the Minecraft server and the MySQL primary.
         String jdbcUrl = "jdbc:mysql://" + host + ":" + port + "/" + database
-                + "?useSSL=false&allowPublicKeyRetrieval=true&autoReconnect=true"
+                + "?sslMode=" + sslMode + "&allowPublicKeyRetrieval=false&autoReconnect=true"
                 + "&failOverReadOnly=false&characterEncoding=utf8"
                 + "&useCompression=true&maxAllowedPacket=67108864";
 
@@ -241,21 +253,76 @@ public class MySqlStorage implements StorageManager {
     }
 
     /**
+     * SQL identifiers cannot be bound through PreparedStatement. Restrict the
+     * configured schema name before it is interpolated into CREATE DATABASE
+     * and the JDBC URL, preventing identifier and connection-string injection.
+     */
+    static String requireSafeIdentifier(String value, String setting) {
+        if (value == null || !value.matches("[A-Za-z0-9_]{1,64}")) {
+            throw new IllegalArgumentException(setting
+                    + " must contain only ASCII letters, digits, or underscore (1-64 characters)");
+        }
+        return value;
+    }
+
+    static String requireSafeHost(String value, String setting) {
+        if (value == null || value.isBlank() || value.length() > 253
+                || !value.matches("[A-Za-z0-9.:-]+")) {
+            throw new IllegalArgumentException(setting + " contains invalid host characters");
+        }
+        return value;
+    }
+
+    static String requireSslMode(String value) {
+        if (value == null) throw new IllegalArgumentException("storage.mysql.ssl-mode is required");
+        String normalized = value.trim().toUpperCase(java.util.Locale.ROOT);
+        return switch (normalized) {
+            case "DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY" -> normalized;
+            default -> throw new IllegalArgumentException("Unsupported storage.mysql.ssl-mode: " + value);
+        };
+    }
+
+    /**
      * Builds a minimal HikariConfig for the one-shot CREATE DATABASE connection.
      */
-    private HikariConfig buildTempConfig(String jdbcUrl, String username, String password) {
+    static HikariConfig buildTempConfig(String jdbcUrl, String username, String password,
+                                        long connectionTimeoutMs) {
         HikariConfig cfg = new HikariConfig();
         cfg.setJdbcUrl(jdbcUrl);
         cfg.setUsername(username);
         cfg.setPassword(password);
         cfg.setMaximumPoolSize(1);
         cfg.setMinimumIdle(0);
-        cfg.setConnectionTimeout(10000);
+        cfg.setConnectionTimeout(connectionTimeoutMs);
+        cfg.setValidationTimeout(Math.min(connectionTimeoutMs, 2000L));
         cfg.setPoolName("VoidVault-TempPool");
         // Disable fail-fast so we don't throw if MySQL is unreachable — the
         // caller already catches SQLException.
         cfg.setInitializationFailTimeout(-1);
         return cfg;
+    }
+
+    /**
+     * Produces a compact, actionable summary without logging credentials or a
+     * full duplicate stack trace. Connector/J may wrap the actual network or
+     * TLS failure after retrying, so retain SQLState/error code and the
+     * deepest available cause message.
+     */
+    static String describeConnectionFailure(SQLException exception) {
+        SQLException deepestSql = exception;
+        for (SQLException next = exception.getNextException(); next != null; next = next.getNextException()) {
+            deepestSql = next;
+        }
+        Throwable deepestCause = deepestSql;
+        while (deepestCause.getCause() != null && deepestCause.getCause() != deepestCause) {
+            deepestCause = deepestCause.getCause();
+        }
+        String message = deepestCause.getMessage();
+        if (message == null || message.isBlank()) {
+            message = deepestSql.getMessage();
+        }
+        return "SQLState=" + deepestSql.getSQLState() + ", errorCode=" + deepestSql.getErrorCode()
+                + ", cause=" + (message == null ? deepestSql.getClass().getSimpleName() : message);
     }
 
     /**

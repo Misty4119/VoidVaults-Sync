@@ -60,6 +60,9 @@ public class RedisConnectionManager implements AutoCloseable {
         if (config.getPassword() != null && !config.getPassword().isEmpty()) {
             clientBuilder.password(config.getPassword());
         }
+        if (config.getUsername() != null && !config.getUsername().isEmpty()) {
+            clientBuilder.user(config.getUsername());
+        }
         JedisClientConfig clientConfig = clientBuilder.build();
 
         this.pool = new JedisPool(new HostAndPort(config.getHost(), config.getPort()), clientConfig);

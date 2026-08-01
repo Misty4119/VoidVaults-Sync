@@ -31,6 +31,9 @@ import java.util.UUID;
  */
 public final class RedisMessage {
 
+    private static final int MAX_MESSAGE_CHARS = 4096;
+    private static final int MAX_PAGES = 1000;
+
     public static final String TYPE_INVALIDATE_FULL = "INVALIDATE_FULL";
     public static final String TYPE_INVALIDATE_PAGE = "INVALIDATE_PAGE";
     public static final String TYPE_HEARTBEAT = "HEARTBEAT";
@@ -139,7 +142,7 @@ public final class RedisMessage {
      * for malformed payloads so the subscriber can log and skip them.
      */
     public static RedisMessage fromJson(String json) {
-        if (json == null || json.isEmpty()) return null;
+        if (json == null || json.isEmpty() || json.length() > MAX_MESSAGE_CHARS) return null;
         try {
             String type = extractString(json, "type");
             String origin = extractString(json, "originServer");
@@ -148,11 +151,24 @@ public final class RedisMessage {
             long ts = extractLong(json, "timestampMs");
             long version = extractLong(json, "version");
             int[] pages = extractPages(json);
-            if (type == null || origin == null) return null;
+            if (!isSupportedType(type) || origin == null || origin.isBlank() || origin.length() > 128) return null;
+            if (TYPE_HEARTBEAT.equals(type)) {
+                if (playerId != null || version != 0L || pages != null) return null;
+            } else {
+                if (playerId == null || version <= 0L) return null;
+                if (TYPE_INVALIDATE_FULL.equals(type) && pages != null) return null;
+                if (TYPE_INVALIDATE_PAGE.equals(type) && pages == null) return null;
+            }
             return new RedisMessage(type, playerId, origin, ts, version, pages);
         } catch (Exception e) {
             return null;
         }
+    }
+
+    private static boolean isSupportedType(String type) {
+        return TYPE_INVALIDATE_FULL.equals(type)
+                || TYPE_INVALIDATE_PAGE.equals(type)
+                || TYPE_HEARTBEAT.equals(type);
     }
 
     private static int[] extractPages(String json) {
@@ -164,9 +180,11 @@ public final class RedisMessage {
         String body = json.substring(start + 1, end);
         if (body.isBlank()) return new int[0];
         String[] parts = body.split(",");
+        if (parts.length > MAX_PAGES) return null;
         int[] result = new int[parts.length];
         for (int i = 0; i < parts.length; i++) {
             result[i] = Integer.parseInt(parts[i].trim());
+            if (result[i] < 1) return null;
         }
         return result;
     }

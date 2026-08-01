@@ -65,11 +65,19 @@ public record PlayerVaultData(
     /**
      * Retrieves a page from the vault, creating it if it doesn't exist.
      *
+     * <p>The default page size is 50 to match the PAGED-mode GUI's 50 storage
+     * slots (inventory slots 0-44 and 49-52). Using 50 here keeps the
+     * {@code dataIndex} mapping inside {@code PagedVaultGUI} consistent with
+     * the stored array on every server start and cross-server transfer,
+     * preventing the 2-slot offset that would occur when the GUI's
+     * {@code saveInventoryToData()} wrote a 50-element array but
+     * {@code getPage()} returned a 52-element page on the next load.</p>
+     *
      * @param pageNumber The page number to retrieve (1-indexed)
      * @return The VaultPage for the specified page number
      */
     public VaultPage getPage(int pageNumber) {
-        return pages.computeIfAbsent(pageNumber, p -> new VaultPage(p, new ItemStack[52]));
+        return pages.computeIfAbsent(pageNumber, p -> new VaultPage(p, new ItemStack[50]));
     }
 
     /**

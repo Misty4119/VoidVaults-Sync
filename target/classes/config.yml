@@ -41,7 +41,10 @@ storage:
     port: 3306
     database: voidvault
     username: voidvault
-    password: change-me
+    password: ""            # required in production; never use a sample/default password
+    # VERIFY_IDENTITY encrypts the connection and verifies the server hostname.
+    # For local development only, DISABLED can be selected explicitly.
+    ssl-mode: VERIFY_IDENTITY
     pool-size: 30
     # Maximum time to wait for a free connection from HikariCP. 3s instead
     # of the default 30s so a saturated pool fails fast at the player
@@ -58,6 +61,7 @@ storage:
     host: 127.0.0.1
     port: 6379
     password: ""           # leave blank if no AUTH
+    username: ""           # Redis ACL user; do not use the default user in production
     use-ssl: false
     database: 0
     timeout-ms: 5000

@@ -179,40 +179,38 @@ public record VaultPage(
      * original instance is left untouched so callers can safely share pages
      * across threads without observing mid-sort state.
      *
-     * <p>Stacks of the same material are merged first so the player does not
-     * end up with 5 slots each holding 16 cobblestone after sorting — they
-     * get collapsed into a smaller number of fully-stacked slots, and the
-     * tail of the slot list ends up empty, which is much easier on the eye
-     * than the old "alphabetical by material name" output.</p>
+     * <p>Items are <em>not</em> merged even when they share the same material,
+     * because two ItemStacks with the same type may carry different meta-data
+     * (enchantments, custom display names, lore, NBT) that would be silently
+     * discarded by a naive amount-merge. The sort therefore preserves every
+     * distinct stack and groups them by category (Weapons → Tools → Armour →
+     * Food → Potions → Redstone → Building Blocks → Natural Blocks →
+     * Decorations → Misc), then sorts alphabetically by material name within
+     * each group. Null/air slots are collected at the end so all occupied
+     * slots are contiguous and always start at index 0.</p>
+     *
+     * @return a new {@link VaultPage} with items sorted from slot 0 onwards;
+     *         trailing slots are {@code null}.
      */
     public VaultPage sorted() {
-        // First pass: gather non-air items, merging stacks of the same
-        // material so we don't end up with N near-empty stacks of cobblestone
-        // taking up valuable slots.
-        Map<String, ItemStack> merged = new java.util.LinkedHashMap<>();
+        // Collect all non-null, non-air items — preserving every individual
+        // stack so that differently-enchanted swords of the same material are
+        // NOT merged (which would silently destroy the second stack).
+        List<ItemStack> items = new java.util.ArrayList<>(contents.length);
         for (ItemStack item : contents) {
-            if (item == null || item.getType().isAir()) {
-                continue;
-            }
-            String key = item.getType().name();
-            ItemStack existing = merged.get(key);
-            if (existing == null) {
-                merged.put(key, item.clone());
-            } else {
-                int combined = Math.min(existing.getMaxStackSize(),
-                        existing.getAmount() + item.getAmount());
-                existing.setAmount(combined);
+            if (item != null && !item.getType().isAir()) {
+                items.add(item.clone());
             }
         }
 
-        // Second pass: group by category using the ItemClassifier helper
-        // below, then sort within each group by material name so the result
-        // is both predictable and not "alphabetical across every type".
+        // Group by category, then sort within each group by material name.
+        // Using EnumMap preserves the enum declaration order, which we then
+        // iterate through via Category.ORDER for a guaranteed stable sequence.
         Map<Category, List<ItemStack>> grouped = new java.util.EnumMap<>(Category.class);
         for (Category c : Category.values()) {
             grouped.put(c, new java.util.ArrayList<>());
         }
-        for (ItemStack item : merged.values()) {
+        for (ItemStack item : items) {
             Category cat = Category.classify(item);
             grouped.get(cat).add(item);
         }
@@ -220,19 +218,22 @@ public record VaultPage(
             bucket.sort((a, b) -> a.getType().name().compareTo(b.getType().name()));
         }
 
-        // Fixed category order (most useful first). The order is exposed via
-        // Category.order() so the player always sees Weapons → Tools →
-        // Armour → … regardless of underlying EnumMap ordering.
+        // Build result array: fill from index 0 so sorted items are always
+        // contiguous at the top, with empty trailing slots — this ensures the
+        // GUI always displays items starting from the very first slot.
         ItemStack[] newContents = new ItemStack[contents.length];
         int index = 0;
         for (Category c : Category.ORDER) {
             for (ItemStack item : grouped.get(c)) {
                 if (index >= newContents.length) {
+                    // Page is full; remaining items are lost (shouldn't happen
+                    // because we started from the same-size array).
                     return new VaultPage(pageNumber, newContents);
                 }
                 newContents[index++] = item;
             }
         }
+        // Remaining slots are already null — trailing empties are kept at end.
         return new VaultPage(pageNumber, newContents);
     }
 

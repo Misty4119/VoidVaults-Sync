@@ -17,6 +17,7 @@ public class RedisConfig {
     private final String host;
     private final int port;
     private final String password;
+    private final String username;
     private final boolean useSsl;
     private final int database;
     private final int timeoutMs;
@@ -57,6 +58,7 @@ public class RedisConfig {
     public RedisConfig(String host,
                        int port,
                        String password,
+                       String username,
                        boolean useSsl,
                        int database,
                        int timeoutMs,
@@ -85,6 +87,7 @@ public class RedisConfig {
         this.host = host;
         this.port = port;
         this.password = password;
+        this.username = username;
         this.useSsl = useSsl;
         this.database = database;
         this.timeoutMs = timeoutMs;
@@ -125,6 +128,7 @@ public class RedisConfig {
         String host = cfg.getString("storage.redis.host", "127.0.0.1");
         int port = cfg.getInt("storage.redis.port", 6379);
         String password = cfg.getString("storage.redis.password", "");
+        String username = cfg.getString("storage.redis.username", "");
         boolean useSsl = cfg.getBoolean("storage.redis.use-ssl", false);
         int database = cfg.getInt("storage.redis.database", 0);
         int timeoutMs = cfg.getInt("storage.redis.timeout-ms", 5000);
@@ -175,7 +179,7 @@ public class RedisConfig {
         boolean keepLegacyV1 = cfg.getBoolean("storage.redis.migration.keep-legacy-v1", false);
 
         return new RedisConfig(
-                host, port, password, useSsl, database, timeoutMs,
+                host, port, password, username, useSsl, database, timeoutMs,
                 poolMaxTotal, poolMaxIdle, poolMinIdle,
                 serverId, invalidationChannel, vaultKeyPrefix, keyTtl,
                 publishOnSave, invalidateOnReceive,
@@ -199,6 +203,7 @@ public class RedisConfig {
     public String getHost() { return host; }
     public int getPort() { return port; }
     public String getPassword() { return password; }
+    public String getUsername() { return username; }
     public boolean isUseSsl() { return useSsl; }
     public int getDatabase() { return database; }
     public int getTimeoutMs() { return timeoutMs; }

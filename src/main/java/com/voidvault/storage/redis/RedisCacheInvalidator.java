@@ -217,7 +217,8 @@ public class RedisCacheInvalidator implements AutoCloseable {
     private void handleEnqueue(String message) {
         RedisMessage msg = RedisMessage.fromJson(message);
         if (msg == null) {
-            logger.fine("Discarded malformed Redis message: " + message);
+            logger.fine(() -> "Discarded malformed Redis message (length="
+                    + (message == null ? 0 : message.length()) + ")");
             return;
         }
         if (msg.getOriginServer() != null
