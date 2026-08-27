@@ -1,10 +1,11 @@
 name: VoidVaults
-version: 2.3.0
+version: 2.4.0
 main: com.voidvault.VoidVaultPlugin
-api-version: '26.1.2'
+api-version: '26.2'
 folia-supported: true
+canvas-supported: true
 author: VoidVault Team
-description: Modern, performance-first Ender Chest replacement for Folia 26.1.2 with Redis 8.0 multi-server sync
+description: Modern, performance-first Ender Chest replacement for Canvas 26.2 with Redis 8.0 multi-server sync
 website: https://example.com
 
 softdepend: [Vault, PlaceholderAPI]
