@@ -56,7 +56,17 @@ import java.util.logging.Logger;
  */
 public class MySqlStorage implements StorageManager {
 
-    public static final int SCHEMA_VERSION = 2;
+    /**
+     * v3 removes the destructive startup "cleanup" used by v2. Existing
+     * tables are data, not temporary migration artefacts, and must never be
+     * replaced implicitly.
+     */
+    public static final int SCHEMA_VERSION = 3;
+    private static final String SCHEMA_LOCK_NAME = "voidvault_schema_migration";
+    private static final int SCHEMA_LOCK_TIMEOUT_SECONDS = 30;
+    private static final Set<String> REQUIRED_PAGE_COLUMNS = Set.of(
+            "id", "player_id", "page_number", "slot_count", "page_data",
+            "compressed", "uncompressed_size", "version", "last_updated");
 
     private final Plugin plugin;
     private final Logger logger;
@@ -104,8 +114,7 @@ public class MySqlStorage implements StorageManager {
         return CompletableFuture.runAsync(() -> {
             try {
                 setupConnectionPool();
-                createTables();
-                runMigrations();
+                initializeSchemaSafely();
                 logger.info("MySQL storage initialized successfully (compression="
                         + (compressionEnabled ? "level " + compressionLevel : "off") + ")");
                 logPoolMetrics("initial");
@@ -326,55 +335,56 @@ public class MySqlStorage implements StorageManager {
     }
 
     /**
-     * Creates the necessary database tables if they don't exist.
+     * Serialises schema work across all server nodes. MySQL advisory locks are
+     * connection-scoped, so a crashed node automatically releases its lock.
      */
-    private void createTables() throws SQLException {
+    private void initializeSchemaSafely() throws SQLException {
+        try (Connection conn = getConnection()) {
+            if (!acquireSchemaLock(conn)) {
+                throw new SQLException("Timed out waiting for another VoidVaults node to finish schema migration");
+            }
+            try {
+                createTables(conn);
+                validatePagesSchema(conn);
+                runMigrations(conn);
+            } finally {
+                releaseSchemaLock(conn);
+            }
+        }
+    }
+
+    static boolean containsOnlySafeSchemaDdl(String sql) {
+        String normalized = sql.toUpperCase(Locale.ROOT);
+        return !normalized.contains("DROP TABLE") && !normalized.contains("TRUNCATE TABLE");
+    }
+
+    private static boolean acquireSchemaLock(Connection conn) throws SQLException {
+        try (PreparedStatement statement = conn.prepareStatement("SELECT GET_LOCK(?, ?)")) {
+            statement.setString(1, SCHEMA_LOCK_NAME);
+            statement.setInt(2, SCHEMA_LOCK_TIMEOUT_SECONDS);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() && result.getInt(1) == 1;
+            }
+        }
+    }
+
+    private static void releaseSchemaLock(Connection conn) {
+        try (PreparedStatement statement = conn.prepareStatement("SELECT RELEASE_LOCK(?)")) {
+            statement.setString(1, SCHEMA_LOCK_NAME);
+            statement.execute();
+        } catch (SQLException ignored) {
+            // Closing the connection also releases the advisory lock.
+        }
+    }
+
+    /** Creates missing tables only; it never mutates or removes existing data. */
+    private void createTables(Connection conn) throws SQLException {
         String createSchemaTable = """
             CREATE TABLE IF NOT EXISTS voidvault_schema (
                 version INT PRIMARY KEY,
                 upgraded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """;
-
-        // Defensive cleanup: if a previous startup was killed mid-migration
-        // (for example the original 2.1.0 release bailed out while creating
-        // voidvault_pages and left a half-built table without the foreign
-        // key, or a database was carried across MySQL/MariaDB versions that
-        // disagree about collation), DROP any leftover voidvault_pages
-        // before we recreate it. Dropping the orphan table is safe because
-        // it is only ever written to *after* the player row exists
-        // (FK enforced) and the latest good state is always mirrored in
-        // Redis; a fresh CREATE will be re-populated by the next save.
-        try (Connection conn = getConnection();
-             Statement stmt = conn.createStatement()) {
-            try (ResultSet rs = stmt.executeQuery(
-                    "SELECT TABLE_NAME, TABLE_COLLATION FROM information_schema.TABLES " +
-                            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'voidvault_pages'")) {
-                if (rs.next()) {
-                    String existing = rs.getString("TABLE_COLLATION");
-                    stmt.executeUpdate("DROP TABLE IF EXISTS voidvault_pages");
-                    logger.warning("Dropped pre-existing voidvault_pages (collation=" + existing
-                            + ") so it can be recreated with the correct utf8mb4_unicode_ci collation.");
-                }
-            }
-            // Same defensive cleanup for the legacy per-slot table: it has
-            // no FK, but kept here so future collation tweaks can rely on a
-            // single migration point.
-            try (ResultSet rs = stmt.executeQuery(
-                    "SELECT TABLE_NAME FROM information_schema.TABLES " +
-                            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'voidvault_items'")) {
-                if (rs.next()) {
-                    stmt.executeUpdate("DROP TABLE IF EXISTS voidvault_items");
-                    logger.warning("Dropped pre-existing voidvault_items (legacy per-slot table)."
-                            + " New writes only go to voidvault_pages.");
-                }
-            }
-        } catch (SQLException cleanupEx) {
-            // The cleanup is best-effort. If it fails (e.g. insufficient
-            // privileges on information_schema), log and continue so the
-            // user still gets a chance to see the real CREATE error.
-            logger.warning("Pre-create cleanup step failed (continuing): " + cleanupEx.getMessage());
-        }
 
         String createPlayersTable = """
             CREATE TABLE IF NOT EXISTS voidvault_players (
@@ -426,8 +436,13 @@ public class MySqlStorage implements StorageManager {
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """;
 
-        try (Connection conn = getConnection();
-             Statement stmt = conn.createStatement()) {
+        if (!containsOnlySafeSchemaDdl(createSchemaTable)
+                || !containsOnlySafeSchemaDdl(createPlayersTable)
+                || !containsOnlySafeSchemaDdl(createPagesTable)
+                || !containsOnlySafeSchemaDdl(createLegacyItemsTable)) {
+            throw new SQLException("Refusing unsafe VoidVaults schema DDL");
+        }
+        try (Statement stmt = conn.createStatement()) {
             stmt.execute(createSchemaTable);
             stmt.execute(createPlayersTable);
             stmt.execute(createPagesTable);
@@ -441,8 +456,7 @@ public class MySqlStorage implements StorageManager {
      * row and applies the migrations that have not yet been run. New
      * deployments will always run every migration up to {@link #SCHEMA_VERSION}.
      */
-    private void runMigrations() throws SQLException {
-        try (Connection conn = getConnection()) {
+    private void runMigrations(Connection conn) throws SQLException {
             int current = readSchemaVersion(conn);
             if (current < 1) {
                 logger.info("Recording schema version " + SCHEMA_VERSION);
@@ -462,17 +476,48 @@ public class MySqlStorage implements StorageManager {
             } else {
                 logger.fine("voidvault schema already at v" + current);
             }
-        }
     }
 
     private int readSchemaVersion(Connection conn) throws SQLException {
         try (Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT version FROM voidvault_schema LIMIT 1")) {
+             ResultSet rs = stmt.executeQuery("SELECT COALESCE(MAX(version), 0) FROM voidvault_schema")) {
             if (rs.next()) {
                 return rs.getInt(1);
             }
             return 0;
         }
+    }
+
+    /**
+     * A pre-existing page table may be an interrupted, old, or manually
+     * modified schema. Refuse to start rather than guessing and destroying
+     * rows. The operator can then back up and perform an explicit migration.
+     */
+    private static void validatePagesSchema(Connection conn) throws SQLException {
+        Set<String> columns = new HashSet<>();
+        try (PreparedStatement statement = conn.prepareStatement(
+                "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                        + "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'voidvault_pages'");
+             ResultSet result = statement.executeQuery()) {
+            while (result.next()) {
+                columns.add(result.getString(1).toLowerCase(Locale.ROOT));
+            }
+        }
+        Set<String> missing = missingRequiredPageColumns(columns);
+        if (!missing.isEmpty()) {
+            throw new SQLException("voidvault_pages has an incompatible schema; missing " + missing
+                    + ". Refusing destructive repair. Restore/backup the database and run an explicit migration.");
+        }
+    }
+
+    static Set<String> missingRequiredPageColumns(Set<String> columns) {
+        Set<String> normalized = new HashSet<>();
+        for (String column : columns) {
+            normalized.add(column.toLowerCase(Locale.ROOT));
+        }
+        Set<String> missing = new TreeSet<>(REQUIRED_PAGE_COLUMNS);
+        missing.removeAll(normalized);
+        return missing;
     }
 
     @Override

@@ -6,7 +6,7 @@
 
     <groupId>com.voidvault</groupId>
     <artifactId>VoidVaults</artifactId>
-    <version>2.4.0</version>
+    <version>2.5.1</version>
     <packaging>jar</packaging>
 
     <name>VoidVaults</name>
@@ -53,11 +53,11 @@
             <version>5.11.4</version>
             <scope>test</scope>
         </dependency>
-        <!-- Exact API shipped by canvas-build.923.jar -->
+        <!-- Exact API shipped by the locally installed canvas-build.941.jar. -->
         <dependency>
             <groupId>io.canvasmc.canvas</groupId>
             <artifactId>canvas-api</artifactId>
-            <version>26.2.build.923-stable</version>
+            <version>26.2.build.941-stable</version>
             <scope>provided</scope>
         </dependency>
 

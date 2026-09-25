@@ -4,6 +4,7 @@ import com.zaxxer.hikari.HikariConfig;
 import org.junit.jupiter.api.Test;
 
 import java.sql.SQLException;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -53,5 +54,21 @@ class MySqlStorageSecurityTest {
 
         org.junit.jupiter.api.Assertions.assertTrue(summary.contains("SQLState=08S01"));
         org.junit.jupiter.api.Assertions.assertTrue(summary.contains("Connection refused"));
+    }
+
+    @Test
+    void schemaDdlGuardRejectsDestructiveStatements() {
+        org.junit.jupiter.api.Assertions.assertTrue(
+                MySqlStorage.containsOnlySafeSchemaDdl("CREATE TABLE IF NOT EXISTS voidvault_pages (id BIGINT)"));
+        org.junit.jupiter.api.Assertions.assertFalse(
+                MySqlStorage.containsOnlySafeSchemaDdl("DROP TABLE voidvault_pages"));
+    }
+
+    @Test
+    void pageSchemaValidationReportsMissingColumnsWithoutMutatingAnything() {
+        Set<String> missing = MySqlStorage.missingRequiredPageColumns(Set.of("id", "player_id", "page_number"));
+
+        org.junit.jupiter.api.Assertions.assertTrue(missing.contains("page_data"));
+        org.junit.jupiter.api.Assertions.assertTrue(missing.contains("version"));
     }
 }

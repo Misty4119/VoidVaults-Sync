@@ -259,7 +259,11 @@ try {
         } catch (Exception ex) {
             String reason = ex.getCause() != null ? ex.getCause().getMessage() : ex.getMessage();
             getLogger().severe("Failed to initialize storage: " + reason);
-            getLogger().warning("Falling back to YAML storage to prevent data loss");
+            if ("MYSQL".equals(storageType)) {
+                throw new IllegalStateException("MySQL storage initialization failed; refusing to fall back to "
+                        + "a node-local YAML file because that can fork shared vault data", ex);
+            }
+            getLogger().warning("Falling back to YAML storage after non-MySQL backend initialization failure");
             storageManager = new YamlStorage(this, dataCache);
             storageManager.initialize().join();
         }
