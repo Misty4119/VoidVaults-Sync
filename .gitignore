@@ -280,3 +280,5 @@ id_dsa
 *.bak
 
 /docs/2.5.0-safe-rollout.md
+
+/docs/research/
