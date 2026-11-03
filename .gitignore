@@ -278,3 +278,5 @@ id_dsa
 # Generic local dumps and backups; no tracked fixtures currently use these suffixes
 *.dump
 *.bak
+
+/docs/2.5.0-safe-rollout.md
