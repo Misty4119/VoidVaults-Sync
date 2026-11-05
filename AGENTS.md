@@ -4,9 +4,9 @@
 
 - `src/main/java/com/voidvault` separates commands, GUI listeners, managers, YAML/MySQL storage, Redis storage, and scheduling utilities. Read `src/main/resources/config.yml` before changing storage modes or network assumptions.
 - Vault contents are durable player assets. Preserve locking, version/conflict checks, save completion/error propagation, dirty cache flushing, close/disconnect handling, and serialization compatibility. Never report a conflicting or failed write as successful.
-- YAML, MYSQL, REDIS, and REDIS_PERSISTENT have different persistence contracts. Redis-primary mode must not be described as database-only invalidation. Review the storage implementation and `docs/research/database-sync-security.md` before changing synchronization.
+- YAML, MYSQL, REDIS, and REDIS_PERSISTENT have different persistence contracts. Redis-primary mode must not be described as database-only invalidation. Review the storage implementation, migration tests, and multi-node synchronization contract before changing synchronization.
 - Use `SchedulerUtil` for live player/inventory/entity operations; keep SQL, Redis, and file I/O asynchronous. Recheck session ownership before applying a delayed callback.
-- Never repair an existing schema by dropping player tables. Follow the current backup and refusal guidance under `docs/`; treat version-specific rollout examples as historical unless verified for the artifact being deployed.
+- Never repair an existing schema by dropping player tables. For schema changes, document backup and refusal guidance in tracked migration docs; treat version-specific rollout examples as historical unless they are verified for the artifact being deployed.
 - Read `pom.xml` for Java/toolchain/dependencies. `mvn test package` verifies and creates the shaded plugin under `target/`. Preserve MIT attribution and license wording.
 
 ## Repository hygiene and verification

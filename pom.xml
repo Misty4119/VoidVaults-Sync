@@ -53,7 +53,7 @@
             <version>5.11.4</version>
             <scope>test</scope>
         </dependency>
-        <!-- Compile against Canvas 26.3 build 985; smoke tests cover 26.2 as well. -->
+        <!-- Compile against Canvas 26.3 build 1009; smoke checks cover 26.2 as well. -->
         <dependency>
             <groupId>io.canvasmc.canvas</groupId>
             <artifactId>canvas-api</artifactId>

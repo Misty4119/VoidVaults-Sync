@@ -73,36 +73,11 @@ backups/
 /banned-ips.json
 
 # Local credentials, databases, and private key material
-.env
-.env.*
 config.local.yml
 config.local.yaml
 config.local.json
 config.local.properties
-secrets.yml
-secrets.yaml
-secrets.json
-secrets.properties
 credentials.local.json
-*.internal.local
-*.private.local
-*.db
-*.db-wal
-*.db-shm
-*.sqlite
-*.sqlite3
-*.sqlite-wal
-*.sqlite-shm
-*.sqlite3-wal
-*.sqlite3-shm
-*.sql.gz
-*.pem
-*.key
-*.p12
-*.pfx
-*.jks
-*.keystore
-*.truststore
 
 # Local logs, crash reports, and process diagnostics
 *.hprof
@@ -133,7 +108,6 @@ internal-data/
 !gradle/wrapper/gradle-wrapper.jar
 !maven-wrapper.jar
 !.mvn/wrapper/maven-wrapper.jar
-!**/src/test/resources/**
 !**/src/test/fixtures/**
 !**/test/fixtures/**
 
@@ -210,15 +184,6 @@ id_ecdsa
 id_dsa
 
 # Documented templates remain publishable after the security rules above
-!**/.env.example
-!**/.env.template
-!**/.env.sample
-!**/credentials.example.*
-!**/credentials.template.*
-!**/credentials.sample.*
-!**/credentials.local.example.*
-!**/credentials.local.template.*
-!**/credentials.local.sample.*
 !**/credentials.example.local.*
 !**/credentials.template.local.*
 !**/credentials.sample.local.*
@@ -228,12 +193,6 @@ id_dsa
 !**/credentials_local.example.*
 !**/credentials_local.template.*
 !**/credentials_local.sample.*
-!**/secrets.example.*
-!**/secrets.template.*
-!**/secrets.sample.*
-!**/secrets.local.example.*
-!**/secrets.local.template.*
-!**/secrets.local.sample.*
 !**/secrets.example.local.*
 !**/secrets.template.local.*
 !**/secrets.sample.local.*
@@ -243,13 +202,8 @@ id_dsa
 !**/secrets_local.example.*
 !**/secrets_local.template.*
 !**/secrets_local.sample.*
-!**/config.local.example.*
-!**/config.local.template.*
-!**/config.local.sample.*
 
 # Nested private credentials and disposable test datasets
-**/.secrets/
-**/test-data/
 
 # Local SQL export names only; schema, migration, and fixture SQL remain eligible for tracking.
 *dump*.sql
@@ -261,17 +215,7 @@ id_dsa
 !**/fixtures/**/*.sql
 
 # Re-exclude local runtime data after broad test-fixture allow rules above.
-**/.plugdev/
-**/test-server*/
-**/server-test*/
 # Nested local Minecraft server state (including test instances)
-**/server.properties
-**/eula.txt
-**/usercache.json
-**/ops.json
-**/whitelist.json
-**/banned-players.json
-**/banned-ips.json
 # World data under nested server roots
 **/server/world*/
 **/servers/**/world*/
@@ -282,3 +226,164 @@ id_dsa
 /docs/2.5.0-safe-rollout.md
 
 /docs/research/
+# Local-only databases, private data, generated logs, and test server state.
+# Keep source-owned test resources and fixtures visible despite data/log suffix rules.
+!**/src/test/resources/**/
+!**/src/test/resources/**
+!**/src/test/**/fixtures/**/
+!**/src/test/**/fixtures/**
+# Keep source-owned main/test resources visible despite generic local-data suffix rules.
+!**/src/**/resources/**/
+!**/src/**/resources/**
+# Historical release JAR copies under docs are local-only.
+/docs/VoidVaults-2.1.0.jar
+/docs/VoidVaults-2.2.0.jar
+
+# BEGIN final local-data guard
+# Generated build output and local IDE/runtime directories.
+**/target/
+**/build/
+**/.gradle/
+**/node_modules/
+**/out/
+**/bin/
+**/dist/
+**/coverage/
+**/.idea/
+**/.vscode/
+# Source package names such as net.example.build remain visible.
+!**/src/**/target/
+!**/src/**/target/**
+!**/src/**/build/
+!**/src/**/build/**
+!**/src/**/dist/
+!**/src/**/dist/**
+!**/src/**/out/
+!**/src/**/out/**
+!**/src/**/bin/
+!**/src/**/bin/**
+!**/src/**/coverage/
+!**/src/**/coverage/**
+# Test servers, private datasets, and generated logs.
+**/.secrets/
+**/private-data/
+**/internal-data/
+**/test-data/
+**/test-data-local/
+**/data-local/
+**/.plugdev/
+**/test-server*/
+**/test-servers*/
+**/server-test*/
+**/logs/
+**/*.log
+**/*.hprof
+**/hs_err_pid*.log
+**/*.tmp
+**/*.swp
+**/*.class
+**/*.pyc
+# Credentials and local environment configuration.
+**/.env
+**/.env.*
+**/credentials.json
+**/credentials.yml
+**/credentials.yaml
+**/credentials.properties
+**/credentials.local.*
+**/credentials.*.local.*
+**/credentials-local.*
+**/credentials_local.*
+**/secrets.json
+**/secrets.yml
+**/secrets.yaml
+**/secrets.properties
+**/secrets.local*
+**/secrets-local.*
+**/secrets_local.*
+**/secret.*
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+**/*.jks
+**/*.keystore
+**/id_rsa
+**/id_ed25519
+**/id_dsa
+**/application.local.yml
+**/application.local.yaml
+**/application.local.properties
+**/application.local.json
+**/config.local.yml
+**/config.local.yaml
+**/config.local.properties
+**/config.local.json
+# Minecraft server configuration and player/server state.
+**/server.properties
+**/eula.txt
+**/usercache.json
+**/ops.json
+**/whitelist.json
+**/banned-players.json
+**/banned-ips.json
+# Local database files and exports.
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.sqlite
+**/*.sqlite-wal
+**/*.sqlite-shm
+**/*.sqlite3
+**/*.sqlite3-wal
+**/*.sqlite3-shm
+**/*.dump
+**/*.bak
+**/*.backup
+**/*.sql.gz
+# Sanitized examples remain visible while local values above stay ignored.
+!**/.env.example
+!**/.env.sample
+!**/.env.template
+!**/credentials.example.*
+!**/credentials.sample.*
+!**/credentials.template.*
+!**/credentials.local.example.*
+!**/credentials.local.sample.*
+!**/credentials.local.template.*
+!**/secrets.example.*
+!**/secrets.sample.*
+!**/secrets.template.*
+!**/secrets.local.example.*
+!**/secrets.local.sample.*
+!**/secrets.local.template.*
+!**/secret.example.*
+!**/secret.sample.*
+!**/secret.template.*
+!**/config.local.example.*
+!**/config.local.sample.*
+!**/config.local.template.*
+# END final local-data guard
+
+# Final high-risk local material rules override source-resource allow-lists above.
+**/*.truststore
+**/*.keystore
+**/*.jks
+**/*.p12
+**/*.pfx
+**/*.pem
+**/*.key
+**/*.p8
+**/*.internal.local
+**/*.private.local
+
+# Explicit private/internal scratch paths; avoid masking language source packages named internal.
+/internal/
+**/test-data-private/
+**/private-test-data/
+**/private-notes/
+**/internal-notes/
+**/docs/private/
+**/docs/internal/
+**/docs/internal-notes*.md
+**/docs/private-notes*.md
