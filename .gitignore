@@ -112,8 +112,8 @@ internal-data/
 !**/test/fixtures/**
 
 
-# Preserve reviewed repository assets and source paths
-!/VoidVaults.iml
+# Ignore local IDE project metadata
+**/*.iml
 
 # Final security guard: fixture allow-lists never re-include private credentials, keys, or database state
 .env
