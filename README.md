@@ -9,7 +9,7 @@ VoidVaults replaces Ender Chest access with configurable personal vaults. SIMPLE
 
 **Target:** Minecraft 26.2–26.3 on Paper, Folia, and Canvas.
 
-**Tested builds:** Paper 26.2 #135 and 26.3 #241; Folia 26.2 #7, 26.3 #3 (required), and #6; Canvas 26.2 #994 and 26.3 #1009 (latest successful 26.3 build checked 2026-11-05). **Verification scope:** Startup, plugin enablement, and general console smoke only; player workflows, data migrations, optional integrations, and cross-server behavior were not tested.
+**Tested builds:** Paper 26.2 #135 and 26.3 #242; Folia 26.2 #7, 26.3 #3 (required), and #6; Canvas 26.2 #994 and 26.3 #1009 (latest successful 26.3 build checked 2026-11-05). **Verification scope:** Startup, plugin enablement, and general console smoke only; player workflows, data migrations, optional integrations, and cross-server behavior were not tested.
 
 ## Build and install
 

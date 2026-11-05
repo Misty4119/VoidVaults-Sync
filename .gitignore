@@ -239,6 +239,43 @@ id_dsa
 /docs/VoidVaults-2.1.0.jar
 /docs/VoidVaults-2.2.0.jar
 
+# Additional recursive credential and private directories.
+**/credentials/
+**/secrets/
+**/.credentials/
+**/private/
+# Source code, resources, and maintained fixtures remain visible when names overlap.
+!**/src/**/resources/
+!**/src/**/resources/**
+# Resource-root secret directories stay private; fixture-nested paths are restored below.
+**/src/**/resources/credentials/
+**/src/**/resources/secrets/
+**/src/**/resources/.credentials/
+**/src/**/resources/private/
+# Keep source files in credential-named Java/Kotlin packages; private payloads stay ignored.
+**/src/**/java/**/credentials/**
+!**/src/**/java/**/credentials/
+!**/src/**/java/**/credentials/**/
+!**/src/**/java/**/credentials/**/*.java
+**/src/**/java/**/secrets/**
+!**/src/**/java/**/secrets/
+!**/src/**/java/**/secrets/**/
+!**/src/**/java/**/secrets/**/*.java
+**/src/**/kotlin/**/credentials/**
+!**/src/**/kotlin/**/credentials/
+!**/src/**/kotlin/**/credentials/**/
+!**/src/**/kotlin/**/credentials/**/*.kt
+**/src/**/kotlin/**/secrets/**
+!**/src/**/kotlin/**/secrets/
+!**/src/**/kotlin/**/secrets/**/
+!**/src/**/kotlin/**/secrets/**/*.kt
+!**/src/**/fixtures/
+!**/src/**/fixtures/**
+!**/test/**/fixtures/
+!**/test/**/fixtures/**
+!**/tests/**/fixtures/
+!**/tests/**/fixtures/**
+
 # BEGIN final local-data guard
 # Generated build output and local IDE/runtime directories.
 **/target/
@@ -341,6 +378,45 @@ id_dsa
 **/*.bak
 **/*.backup
 **/*.sql.gz
+# BEGIN source-owned fixture exceptions
+# Maintained fixture trees remain visible even when their files use data/log suffixes.
+!**/src/**/fixtures/
+!**/src/**/fixtures/**
+!**/test/**/fixtures/
+!**/test/**/fixtures/**
+!**/tests/**/fixtures/
+!**/tests/**/fixtures/**
+# Keep credential files private even inside maintained fixture trees.
+**/.env
+**/.env.*
+**/credentials.json
+**/credentials.yml
+**/credentials.yaml
+**/credentials.properties
+**/credentials.local
+**/credentials.local.*
+**/credentials.*.local
+**/credentials.*.local.*
+**/credentials-local.*
+**/credentials_local.*
+**/secrets.json
+**/secrets.yml
+**/secrets.yaml
+**/secrets.properties
+**/secrets.local*
+**/secrets.*.local*
+**/secrets-local.*
+**/secrets_local.*
+**/secret.*
+**/application.local.yml
+**/application.local.yaml
+**/application.local.properties
+**/application.local.json
+**/config.local.yml
+**/config.local.yaml
+**/config.local.properties
+**/config.local.json
+# END source-owned fixture exceptions
 # Sanitized examples remain visible while local values above stay ignored.
 !**/.env.example
 !**/.env.sample
@@ -387,3 +463,18 @@ id_dsa
 **/docs/internal/
 **/docs/internal-notes*.md
 **/docs/private-notes*.md
+
+# Database state and exports remain ignored even inside re-included fixtures.
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.sqlite
+**/*.sqlite-wal
+**/*.sqlite-shm
+**/*.sqlite3
+**/*.sqlite3-wal
+**/*.sqlite3-shm
+**/*.dump
+**/*.bak
+**/*.backup
+**/*.sql.gz
